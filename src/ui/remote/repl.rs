@@ -106,6 +106,7 @@ pub(crate) fn run_ratatui_repl_with_remote(
                     }) => {
                         streamed = true;
                         remote.shell.finish();
+                        remote.app.turn.reset_presses();
                         finish_shell_command(
                             &mut remote,
                             &command,

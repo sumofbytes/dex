@@ -1498,3 +1498,37 @@ fn child_log_count_is_capped_and_view_closes_on_dropped_log() {
     assert_eq!(remote.app.child_logs[0].id, "a1", "oldest dropped");
     assert!(remote.app.child_view.is_none(), "view closed");
 }
+
+#[test]
+fn finishing_the_turn_restarts_the_shells_force_quit_count() {
+    // The Ctrl+C press count is shared across a turn and a `!` shell: ending
+    // (or starting) one job restarts the other's count without ending its
+    // cancel, as the old single `cancel_presses` counter did.
+    let mut remote = test_remote();
+    remote.app.turn.start();
+    remote.shell.start();
+    remote.shell.cancel();
+    remote.shell.bump();
+    remote.shell.bump();
+    assert_eq!(remote.shell.presses(), 2);
+    super::input::finish_turn(&mut remote, None);
+    assert!(remote.shell.is_cancelling(), "shell cancel still pending");
+    assert_eq!(remote.shell.presses(), 0);
+}
+
+#[test]
+fn overlapping_cancel_needs_three_fresh_presses_after_the_other_job_ends() {
+    let mut remote = test_remote();
+    remote.app.turn.start();
+    remote.shell.start();
+    handle_key(&mut remote, ctrl_c());
+    handle_key(&mut remote, ctrl_c());
+    assert!(!remote.app.quit);
+    // The turn ends; the shell's count restarts rather than carrying over.
+    super::input::finish_turn(&mut remote, None);
+    handle_key(&mut remote, ctrl_c());
+    handle_key(&mut remote, ctrl_c());
+    assert!(!remote.app.quit, "two presses after a reset must not quit");
+    handle_key(&mut remote, ctrl_c());
+    assert!(remote.app.quit, "third press force-quits");
+}

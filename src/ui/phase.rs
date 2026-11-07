@@ -71,6 +71,15 @@ impl Phase {
         }
     }
 
+    /// Restart the Ctrl+C count without leaving `Cancelling`. Starting or
+    /// ending the *other* cancellable job calls this, so the force-quit press
+    /// count behaves as one shared counter across a turn and a `!` shell.
+    pub(crate) fn reset_presses(&mut self) {
+        if let Self::Cancelling { presses } = self {
+            *presses = 0;
+        }
+    }
+
     /// Drop a pending cancel without ending the job (`Cancelling -> Running`).
     pub(crate) fn clear_cancel(&mut self) {
         if self.is_cancelling() {
@@ -108,6 +117,17 @@ mod tests {
         p.clear_cancel();
         assert_eq!(p, Phase::Running);
         assert_eq!(p.presses(), 0);
+    }
+
+    #[test]
+    fn reset_presses_keeps_cancelling() {
+        let mut p = Phase::Running;
+        p.reset_presses();
+        assert_eq!(p, Phase::Running, "no-op outside Cancelling");
+        p.cancel();
+        p.bump();
+        p.reset_presses();
+        assert_eq!(p, Phase::Cancelling { presses: 0 });
     }
 
     #[test]

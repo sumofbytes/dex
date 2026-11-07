@@ -858,6 +858,7 @@ fn request_cancel(remote: &mut RemoteApp) {
 fn run_shell_command(remote: &mut RemoteApp, line: String, command: String, excluded: bool) {
     render_user_prompt(&mut remote.app, &line);
     remote.shell.start();
+    remote.app.turn.reset_presses();
     let client = remote.client.clone();
     let sid = remote.session_id.clone();
     let tx = remote.worker_tx.clone();
@@ -1092,6 +1093,7 @@ fn submit_prompt(remote: &mut RemoteApp, is_followup: bool) {
 
     let app = &mut remote.app;
     app.turn.start();
+    remote.shell.reset_presses();
     // Live "● Working" indicator inside the transcript; settled to the
     // "Worked for …" summary by `finish_turn`.
     start_activity(app);

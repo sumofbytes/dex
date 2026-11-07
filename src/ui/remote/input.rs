@@ -620,6 +620,7 @@ pub(crate) fn finish_turn(remote: &mut RemoteApp, error: Option<String>) {
         resolve_all_questions(app);
     }
     app.turn.finish();
+    remote.shell.reset_presses();
     // A turn can end right after thinking (cancel, failure before any text);
     // settle the indicator instead of leaving the dots animating forever.
     close_thinking(app);
