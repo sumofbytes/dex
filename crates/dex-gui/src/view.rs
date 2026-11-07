@@ -1,7 +1,7 @@
 //! Views: sidebar, transcript, composer, footer. Pure functions of `State`.
 
 use dex_client::protocol::ApprovalDecision;
-use rune::{Cx, El, ScrollSpec, col, el, row, spacer, text, text_input};
+use rune::{Cursor, Cx, Drag, El, Phase, ScrollSpec, Tx, col, el, row, spacer, text, text_input};
 use rune_kit::markdown::{Markdown, MarkdownStyle};
 use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons;
@@ -10,8 +10,9 @@ use crate::state::{Cmd, Item, Page, State, VTab};
 use crate::style::{space, typo};
 
 const COLUMN: f32 = 760.0;
-/// Left indent of what opens under a quiet row: tool calls and a thought's text share it.
-const NESTED: f32 = 14.0;
+/// Left indent of what opens under a quiet row: tool names and a thought's chevron sit here,
+/// on the work head's text column (head padding 8 + chevron 12 + gap 6).
+const NESTED: f32 = 26.0;
 /// The content line: text, bubbles and the footer sit this far inside the composer card's edge,
 /// where the input's own text starts, so everything shares a left and a right edge.
 const CONTENT: f32 = 12.0;
@@ -23,31 +24,78 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
         Page::Home => crate::home::home(s, k),
         Page::Thread => main_pane(s, k, &mut layer),
     };
-    let body = if s.sidebar {
-        row()
-            .w_full()
-            .h_full()
-            .fill(k.c.page)
-            .child(crate::sidebar::sidebar(s, k).w(crate::sidebar::tok::WIDTH))
+    let mut body = row().w_full().h_full().fill(k.c.page);
+    if s.sidebar {
+        body = body
+            .child(crate::sidebar::sidebar(s, k).w(s.sidebar_w))
             .child(el().w(1.0).h_full().fill(k.c.border_base))
             .child(page.grow(1.0).min_w(0.0))
-            .children(viewer_col(s, k))
+            .child(sidebar_edge(s));
     } else {
-        row().w_full().h_full().fill(k.c.page).child(page.grow(1.0))
-    };
+        body = body.child(page.grow(1.0));
+    }
+    if s.viewer && s.page == Page::Thread {
+        body = body
+            .child(el().w(1.0).h_full().fill(k.c.border_base))
+            .child(crate::viewer::viewer(s, k))
+            .child(viewer_edge(s));
+    }
     crate::theme_picker::picker(s, k, &mut layer);
     rune_kit::root(body, layer)
 }
 
-/// The viewer pane with its divider, on thread pages only.
-fn viewer_col(s: &State, k: &Kit) -> Vec<El> {
-    if !(s.viewer && s.page == Page::Thread) {
-        return Vec::new();
-    }
-    vec![
-        el().w(1.0).h_full().fill(k.c.border_base),
-        crate::viewer::viewer(s, k),
-    ]
+/// The sidebar divider's drag strip, straddling the 1pt rule the way the Rune playground's own
+/// edge strips do (`playground/widths.rs`): 8 wide and full height, over both panes, so the
+/// pane stretches from the boundary and stays easy to grab. Dragging moves the edge, double-
+/// click resets the width, Escape (a cancelled gesture) reverts the drag.
+fn sidebar_edge(s: &State) -> El {
+    el().key("sidebar-edge")
+        .pin(Some(s.sidebar_w - 3.5), Some(0.0), None, Some(0.0))
+        .w(8.0)
+        .cursor(Cursor::ResizeColumn)
+        .help(format!(
+            "Drag to stretch the sidebar; double-click for {}",
+            crate::sidebar::tok::WIDTH,
+        ))
+        .on_drag(|s: &mut State, d: &mut Drag, tx: &mut Tx| {
+            tx.instant();
+            match d.phase {
+                Phase::Down => d.data = s.sidebar_w,
+                Phase::Move => s.drag_sidebar(d.data, d.dx),
+                Phase::Up if d.cancelled() => s.sidebar_w = d.data,
+                _ => {}
+            }
+        })
+        .on_double_press_tx(|s: &mut State, tx: &mut Tx| {
+            tx.instant();
+            s.sidebar_w = crate::sidebar::tok::WIDTH;
+        })
+}
+
+/// The viewer divider's drag strip: the viewer sits at the window's right edge, so the strip is
+/// pinned to the right (`dx` reverses sign in `State::drag_viewer`).
+fn viewer_edge(s: &State) -> El {
+    el().key("viewer-edge")
+        .pin(None, Some(0.0), Some(s.viewer_w - 3.5), Some(0.0))
+        .w(8.0)
+        .cursor(Cursor::ResizeColumn)
+        .help(format!(
+            "Drag to stretch the viewer; double-click for {}",
+            crate::viewer::WIDTH,
+        ))
+        .on_drag(|s: &mut State, d: &mut Drag, tx: &mut Tx| {
+            tx.instant();
+            match d.phase {
+                Phase::Down => d.data = s.viewer_w,
+                Phase::Move => s.drag_viewer(d.data, d.dx),
+                Phase::Up if d.cancelled() => s.viewer_w = d.data,
+                _ => {}
+            }
+        })
+        .on_double_press_tx(|s: &mut State, tx: &mut Tx| {
+            tx.instant();
+            s.viewer_w = crate::viewer::WIDTH;
+        })
 }
 
 fn main_pane(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
@@ -56,6 +104,7 @@ fn main_pane(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .h_full()
         .fill(k.c.page)
         .child(header(s, k))
+        .child(crate::style::edge(k))
         .child(transcript(s, k))
         .child(composer(s, k, layer))
         .child(footer(s, k));
@@ -240,25 +289,29 @@ fn transcript(s: &State, k: &Kit) -> El {
         )
 }
 
-/// The live row while a turn runs: spinner, label, and a ghost Stop button (with its Esc hint) at
-/// the right end of the content line. Gone once the turn ends.
+/// The ghost Stop button a live row carries, with its Esc hint.
+fn stop_button(k: &Kit) -> El {
+    k.interactive(
+        row()
+            .h(24.0)
+            .px(space::LG)
+            .gap(space::MD)
+            .items_center()
+            .radius(k.radius.md)
+            .child(text("Stop").font(k.ty.ui_medium).color(k.c.text_muted))
+            .child(text("Esc").font(typo::time(k)).color(k.c.text_faint)),
+    )
+    .on_press(|s: &mut State| s.send_cmd(Cmd::Cancel))
+    .key("stop")
+}
+
+/// The live row while a turn runs: spinner on the block head's mark column (head padding 8),
+/// label on its text column, and the ghost Stop button at the right end. Gone once the turn ends.
 fn live_row(k: &Kit, label: &str) -> El {
-    let stop = k
-        .interactive(
-            row()
-                .h(24.0)
-                .px(space::LG)
-                .gap(space::MD)
-                .items_center()
-                .radius(k.radius.md)
-                .child(text("Stop").font(k.ty.ui_medium).color(k.c.text_muted))
-                .child(text("Esc").font(typo::time(k)).color(k.c.text_faint)),
-        )
-        .on_press(|s: &mut State| s.send_cmd(Cmd::Cancel))
-        .key("stop");
     row()
         .w_full()
         .h(24.0)
+        .px(space::MD)
         .gap(space::SM)
         .items_center()
         .child(Spinner::new().size(12.0).build(k))
@@ -268,16 +321,19 @@ fn live_row(k: &Kit, label: &str) -> El {
                 .color(k.c.text_muted),
         )
         .child(spacer().grow(1.0))
-        .child(stop)
+        .child(stop_button(k))
 }
 
 /// A run of tool calls (`start..end`): a quiet summary line that opens to the rows.
-/// A run of thoughts and tool calls (`start..end`) as one block. Done: a quiet row, `› Worked
-/// for 14s  2 thoughts · 5 commands`, collapsed; opened it nests the rows in order, each thought
-/// still folding on its own. Live (the run is still being worked): a spinner and "Working", open.
+/// A run of thoughts and tool calls (`start..end`) as one block. Always collapsed by default,
+/// live or done: `› Working · 4s  [Stop]` while it runs, `› Worked
+/// for 14s  2 thoughts · 5 commands` done; opening it nests the rows in order, each thought
+/// still folding on its own, and the row carries a header-like fill so the start of the block
+/// stays findable while its content flows under it.
 fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
     let live = s.busy && end == s.items.len();
-    let open = live || s.open_work.contains(&start);
+    // Collapsed only, in both states; opening survives the turn's end (the same `start`).
+    let open = s.open_work.contains(&start);
     let (thoughts, commands, secs) = crate::state::work_summary(&s.items[start..end]);
     let plural =
         |n: usize, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
@@ -289,35 +345,68 @@ fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
     .flatten()
     .collect::<Vec<_>>()
     .join(" · ");
-    let head = row()
-        .key(format!("work{start}"))
-        .h(20.0)
-        .gap(space::SM)
-        .items_center();
+    let open_toggle = move |s: &mut State| {
+        if !s.open_work.remove(&start) {
+            s.open_work.insert(start);
+        }
+    };
+    let chevron = if open {
+        &crate::icons::DOWN
+    } else {
+        &crate::icons::RIGHT
+    };
     let head = if live {
         // The first thought's start gives a running time; without one the label stands alone.
-        let label = match s.items[start..end].iter().find_map(|i| match i {
+        let secs = s.items[start..end].iter().find_map(|i| match i {
             Item::Thinking {
                 started: Some(t), ..
             } => Some(t.elapsed().as_secs()),
             _ => None,
-        }) {
-            Some(n) if n >= 1 => format!("Working · {n}s"),
-            _ => "Working".to_string(),
-        };
-        live_row(k, &label).key(format!("work{start}"))
+        });
+        // The latest tool call or thought sits between "Working" and the time; it stays up
+        // while the model thinks, so a finished tool keeps its name until the next one starts.
+        let activity = s.items[start..end].iter().rev().find_map(|i| match i {
+            Item::Tool(t) => Some(t.name.clone()),
+            Item::Thinking { .. } => Some("Thinking".to_string()),
+            _ => None,
+        });
+        let mut label = String::from("Working");
+        if let Some(a) = &activity {
+            label.push_str(" · ");
+            label.push_str(a);
+        }
+        if let Some(n) = secs.filter(|n| *n >= 1) {
+            label.push_str(&format!(" · {n}s"));
+        }
+        row()
+            .key(format!("work{start}"))
+            .w_full()
+            .h(24.0)
+            .px(space::MD)
+            .gap(space::SM)
+            .items_center()
+            .radius(k.radius.md)
+            // The spinner takes the chevron's place while live, so its label sits on the same
+            // text column as the done row's (padding + spinner 12 + gap 6 = padding + chevron 12 + gap 6).
+            .child(Spinner::new().size(12.0).build(k))
+            .child(text(label).font(k.ty.ui_medium).color(k.c.text_muted))
+            .child(spacer().grow(1.0))
+            .child(stop_button(k))
     } else {
-        let chevron = if open {
-            &crate::icons::DOWN
-        } else {
-            &crate::icons::RIGHT
-        };
         let label = if secs.round() >= 1.0 {
             format!("Worked for {}s", secs.round() as u64)
         } else {
             "Worked".to_string()
         };
-        head.child(rune::icon(chevron, 12.0).color(k.c.text_faint))
+        row()
+            .key(format!("work{start}"))
+            .w_full()
+            .h(24.0)
+            .px(space::MD)
+            .gap(space::SM)
+            .items_center()
+            .radius(k.radius.md)
+            .child(rune::icon(chevron, 12.0).color(k.c.text_faint))
             .child(text(label).font(typo::meta(k)).color(k.c.text_faint))
             .child(
                 text(detail)
@@ -325,16 +414,11 @@ fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
                     .color(k.c.text_faint.alpha(0.75)),
             )
     };
-    let head = if live {
-        head
-    } else {
-        k.interactive(head).on_press(move |s: &mut State| {
-            if !s.open_work.remove(&start) {
-                s.open_work.insert(start);
-            }
-        })
-    };
-    let mut group = col().w_full().gap(space::XS).child(head);
+    // Open, the row takes the hover colour as a header band; collapsed, it stays quiet and the
+    // kit's hover fill shows only under the pointer.
+    let head = if open { head.fill(k.c.hover) } else { head };
+    let toggle_head = k.interactive(head).on_press(open_toggle);
+    let mut group = col().w_full().gap(space::XS).child(toggle_head);
     if open {
         for i in start..end {
             // Thoughts inside a block are plain rows: the block's header carries the spinner.
@@ -385,11 +469,12 @@ fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>) -> El 
         }));
     if open {
         group = group.child(
+            // Under the row's own chevron + gap, flush with its label.
             text(text_.to_string())
                 .font(typo::meta(k))
                 .color(k.c.text_faint)
                 .wrap()
-                .pl(NESTED),
+                .pl(18.0),
         );
     }
     group
@@ -583,6 +668,8 @@ fn item(i: usize, it: &Item, k: &Kit) -> El {
 }
 
 fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+    // The field's height follows its wrapped lines in the same frame. Springing it (rune's
+    // `auto_grow`) leaves the new line flush against the bottom edge until the spring catches up.
     let input = text_input(&s.edit, k.ty.body.lh(22.0))
         .key("composer-input")
         .placeholder("Ask anything…", k.c.text_faint)

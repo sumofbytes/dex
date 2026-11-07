@@ -110,6 +110,7 @@ pub fn home(s: &State, k: &Kit) -> El {
             .w_full()
             .min_w(0.0)
             .h(56.0)
+            .px(space::LG)
             .gap(space::XL)
             .items_center()
             .child(

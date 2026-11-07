@@ -1,5 +1,6 @@
-//! Sidebar, on one grid (see DESIGN.md): a 16 lead column (nav icon, project dot or spinner, a
-//! running thread's spinner), a text column (labels, project names, titles) and a trailing edge
+//! Sidebar, on one grid (see DESIGN.md): a 16 lead column holding marks flush with the row's
+//! leading edge (nav icon, a project's folder icon, a running thread's spinner — sized 16 like
+//! the folder icon), a text column (labels, project names, titles) and a trailing edge
 //! (a 20 slot for + and ×, then the time column). Every row is built from the same chrome, so
 //! their positions cannot drift. All sizes come from `tok`.
 
@@ -22,19 +23,17 @@ pub mod tok {
     pub const PAD: f32 = 10.0;
     /// Every row: nav, project header, thread.
     pub const ROW_H: f32 = 32.0;
-    /// The lead column: nav icon, project dot / spinner, thread spinner (centred in it).
+    /// The lead column: nav icon, project folder icon, a thread's status dot or spinner
+    /// (any mark starts at the row's leading edge).
     pub const LEAD: f32 = 16.0;
     /// Between the lead column and the text column (text starts at 22 + 16 + 8 = 46).
     pub const LEAD_GAP: f32 = 8.0;
     /// The trailing slot: + on a project, × on hover.
     pub const SLOT: f32 = 20.0;
-    /// Thread rows nest under their project: the fill starts at MARGIN + 22 = 34, the mark's
-    /// centre sits at 46 and the title at 58 (8 pad + 8 mark + 8 gap).
-    pub const THREAD_INDENT: f32 = 22.0;
-    pub const THREAD_PAD: f32 = 8.0;
-    pub const THREAD_LEAD: f32 = 8.0;
     pub const DOT: f32 = 6.0;
-    pub const SPINNER: f32 = 8.0;
+    /// Same as the lead column: matches the folder icon's 16 so a running thread's mark reads
+    /// at the same weight as a project's.
+    pub const SPINNER: f32 = 16.0;
     pub const PER_PROJECT: usize = 5;
     pub const PROJECTS: usize = 12;
 }
@@ -56,13 +55,11 @@ pub fn ago(updated_at: &str) -> String {
 }
 
 /// The chrome every row shares: an outer hit area the full width (the hover group for the ×) and
-/// a body that carries the hover and selected fill, content and trailing edges inside it. Nav and
-/// project rows fill 12 to 268; thread rows start the fill at their indent (`THREAD_INDENT`),
-/// like their text.
+/// a body that carries the hover and selected fill, content and trailing edges inside it. Every
+/// row fills 12 to 268; hierarchy comes from type (small bold caps vs regular text), not indent.
 struct Shell {
     outer: El,
     body: El,
-    indent: f32,
     edges: Vec<El>,
 }
 
@@ -93,7 +90,6 @@ impl Shell {
         let Shell {
             outer,
             mut body,
-            indent,
             edges,
         } = self;
         if !edges.is_empty() {
@@ -101,29 +97,19 @@ impl Shell {
             // weight is tiny so a growing title (which truncates) takes nearly all of it.
             body = body.child(spacer().grow(0.001)).children(edges);
         }
-        let out = if indent > 0.0 {
-            outer.child(el().w(indent).h(tok::ROW_H))
-        } else {
-            outer
-        };
-        out.child(body.grow(1.0).min_w(0.0))
+        outer.child(body.grow(1.0).min_w(0.0))
     }
 }
 
 fn shell(k: &Kit, key: String, selected: bool) -> Shell {
-    row_shell(k, key, selected, 0.0, tok::PAD)
+    row_shell(k, key, selected)
 }
 
-/// A thread row's chrome: indented under its project.
-fn thread_shell(k: &Kit, key: String, selected: bool) -> Shell {
-    row_shell(k, key, selected, tok::THREAD_INDENT, tok::THREAD_PAD)
-}
-
-fn row_shell(k: &Kit, key: String, selected: bool, indent: f32, pad_left: f32) -> Shell {
+fn row_shell(k: &Kit, key: String, selected: bool) -> Shell {
     // 32 tall, 8 radius; shrink lets a long title truncate instead of overflowing.
     let mut body = row()
         .h(tok::ROW_H)
-        .pl(pad_left)
+        .pl(tok::PAD)
         .pr(tok::PAD)
         .gap(tok::LEAD_GAP)
         .items_center()
@@ -139,7 +125,6 @@ fn row_shell(k: &Kit, key: String, selected: bool, indent: f32, pad_left: f32) -
             .h(tok::ROW_H)
             .items_center(),
         body: k.interactive(body),
-        indent,
         edges: Vec::new(),
     }
 }
@@ -149,17 +134,16 @@ fn boxed(size: f32, child: El) -> El {
     row().size(size, size).center().child(child)
 }
 
-/// A thread row's mark column (8 wide: dot or spinner).
-fn thread_lead(child: El) -> El {
-    boxed(tok::THREAD_LEAD, child)
-}
-
-fn thread_lead_gap() -> El {
-    row().size(tok::THREAD_LEAD, tok::THREAD_LEAD)
-}
-
+/// A row's lead column: 16 wide, content vertically centred and flush with the row's leading
+/// edge — the same edge the PROJECTS and NEEDS YOU labels start on. (Trailing slots stay
+/// centred: they are buttons, not marks.)
 fn lead(child: El) -> El {
-    boxed(tok::LEAD, child)
+    row().size(tok::LEAD, tok::LEAD).center_y().child(child)
+}
+
+/// An empty lead column so a thread title aligns with its project's text even with no mark.
+fn lead_gap() -> El {
+    boxed(tok::LEAD, spacer())
 }
 
 fn spinner(k: &Kit) -> El {
@@ -243,11 +227,11 @@ fn thread_row_as(
         };
         lead(dot(color, tok::DOT))
     } else if waiting {
-        thread_lead(dot(crate::theme::waiting(), tok::DOT))
+        lead(dot(crate::theme::waiting(), tok::DOT))
     } else if running {
-        thread_lead(spinner(k))
+        lead(spinner(k))
     } else {
-        thread_lead_gap()
+        lead_gap()
     };
     let age = ago(&sess.updated_at);
     let time = if with_project {
@@ -261,10 +245,9 @@ fn thread_row_as(
     };
     // A renaming row shows a text field instead of its title, bound to the state's edit.
     let edit = (s.renaming.as_deref() == Some(sess.session_id.as_str())).then(|| s.rename.clone());
-    // NEEDS YOU rows are not nested under a project: plain full-width rows.
-    let nested = status.is_none();
+    // NEEDS YOU rows sit on the same grid as every other row.
     thread_chrome(
-        k, key, selected, nested, mark, sess, title, id, open_cwd, hide_id, edit, time,
+        k, key, selected, mark, sess, title, id, open_cwd, hide_id, edit, time,
     )
 }
 
@@ -275,7 +258,6 @@ fn thread_chrome(
     k: &Kit,
     key: String,
     selected: bool,
-    nested: bool,
     mark: El,
     sess: &SessionInfo,
     title: Option<String>,
@@ -318,41 +300,38 @@ fn thread_chrome(
             .grow(1.0)
             .min_w(0.0),
     };
-    if nested {
-        thread_shell(k, key.clone(), selected)
-    } else {
-        shell(k, key.clone(), selected)
-    }
-    .child(mark)
-    .child(title)
-    .edge(boxed(
-        tok::SLOT,
-        IconButton::new(&kit_icons::CLOSE)
-            .control_size(ControlSize::Small)
-            .variant(IconButtonVariant::GhostMuted)
-            .label("Hide thread from sidebar")
-            .on_press(move |s: &mut State| s.hide_thread(&hide_id))
-            .build(k)
-            .key(format!("{key}-hide"))
-            .group_opacity(0.0, 1.0),
-    ))
-    .edge(time)
-    .on_press(move |s: &mut State| {
-        // A press during a rename ends the edit (Return would too); don't jump threads.
-        if s.renaming.is_some() {
-            s.commit_rename();
-            return;
-        }
-        s.project = Some(open_cwd.clone());
-        s.page = Page::Thread;
-        s.send_cmd(Cmd::Open(id.clone()));
-    })
-    .on_double_press(move |s: &mut State| {
-        if s.renaming.is_none() {
-            s.start_rename(&rename_id);
-        }
-    })
-    .build()
+    let shell = shell(k, key.clone(), selected);
+    shell
+        .child(mark)
+        .child(title)
+        .edge(boxed(
+            tok::SLOT,
+            IconButton::new(&kit_icons::CLOSE)
+                .control_size(ControlSize::Small)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Hide thread from sidebar")
+                .on_press(move |s: &mut State| s.hide_thread(&hide_id))
+                .build(k)
+                .key(format!("{key}-hide"))
+                .group_opacity(0.0, 1.0),
+        ))
+        .edge(time)
+        .on_press(move |s: &mut State| {
+            // A press during a rename ends the edit (Return would too); don't jump threads.
+            if s.renaming.is_some() {
+                s.commit_rename();
+                return;
+            }
+            s.project = Some(open_cwd.clone());
+            s.page = Page::Thread;
+            s.send_cmd(Cmd::Open(id.clone()));
+        })
+        .on_double_press(move |s: &mut State| {
+            if s.renaming.is_none() {
+                s.start_rename(&rename_id);
+            }
+        })
+        .build()
 }
 
 /// What a project header needs: pressing anywhere on it toggles collapse.
@@ -360,21 +339,15 @@ struct ProjectHeader {
     key: String,
     name: String,
     color: rune::Color,
-    /// A thread in this project is running: its dot becomes a spinner.
-    running: bool,
     cwd: String,
 }
 
-/// `[dot|spinner] NAME ........ [×] [+]`: no chevron, the whole row toggles; × shows on hover.
+/// `[folder icon] NAME ........ [×] [+]`: no chevron, the whole row toggles; × shows on hover.
+/// The folder icon is static — running threads show their spinner on their own row, not here.
 fn project_header(k: &Kit, p: ProjectHeader) -> El {
     let (toggle, add, hide) = (p.cwd.clone(), p.cwd.clone(), p.cwd.clone());
-    let mark = if p.running {
-        spinner(k)
-    } else {
-        dot(p.color, tok::DOT)
-    };
     shell(k, p.key.clone(), false)
-        .child(lead(mark))
+        .child(lead(rune::icon(&icons::FOLDER, 16.0).color(p.color)))
         .child(
             text(p.name.to_uppercase())
                 .font(typo::caps(k))
@@ -418,8 +391,8 @@ fn project_header(k: &Kit, p: ProjectHeader) -> El {
 
 /// A quiet row under a list ("Show 2 more"), its text in the text column.
 fn more_link(k: &Kit, key: String, label: String, f: impl Fn(&mut State) + 'static) -> El {
-    thread_shell(k, key, false)
-        .child(thread_lead_gap())
+    shell(k, key, false)
+        .child(lead_gap())
         .child(text(label).font(typo::meta(k)).color(k.c.text_faint))
         .on_press(move |s: &mut State| f(s))
         .build()
@@ -511,6 +484,10 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
         );
     }
 
+    // A border under the header block, out to the sidebar's edges: the header column is inset
+    // by MARGIN, so the rule negative-margins back to full bleed.
+    sb = sb.header(el().w_full().h(1.0).fill(k.c.border_base).ml(-tok::MARGIN));
+
     let query = s.search.text.trim().to_lowercase();
     if s.searching && !query.is_empty() {
         for (i, sess) in s
@@ -586,10 +563,6 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
                 key: format!("proj{pi}"),
                 color: crate::theme::project_color(&name),
                 name,
-                running: threads.iter().any(|t| {
-                    s.running.contains(&t.session_id)
-                        || (s.busy && s.current.as_deref() == Some(t.session_id.as_str()))
-                }),
                 cwd: cwd.clone(),
             },
         ));

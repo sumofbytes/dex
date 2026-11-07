@@ -23,6 +23,7 @@ fn setup(s: &mut State, wake: Waker) {
     let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
     s.cmds = Some(tx);
     s.load_hidden();
+    s.load_term_history();
     s.load_theme();
     s.wake = Some(wake.clone());
     worker::spawn(s.inbox.clone(), wake, rx);
@@ -40,7 +41,7 @@ fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
         s.show_viewer(state::VTab::Files);
     } else if e.is_command('g') {
         s.show_viewer(state::VTab::Changes);
-    } else if e.is_command('j')
+    } else if e.is_command('`')
         || matches!(&e.key, rune::Key::Text(t) if t == "`" && (e.mods.cmd || e.mods.ctrl))
     {
         s.page = state::Page::Thread;
@@ -61,9 +62,17 @@ fn on_key(s: &mut State, e: &KeyEvent, _: &mut Tx) -> bool {
     true
 }
 
-fn poll(s: &mut State, _: f64, _: &mut Tx) -> bool {
+fn poll(s: &mut State, _: f64, tx: &mut Tx) -> bool {
+    // A line that wraps is laid out one commit before the field's height catches up, and an idle
+    // window draws no further frame, so the new line sits flush against the chips until the
+    // next keystroke. Ask for one more commit after each edit.
+    let edited = s.edit.text != s.edit_seen;
+    if edited {
+        s.edit_seen = s.edit.text.clone();
+        tx.wake_after(std::time::Duration::ZERO);
+    }
     let msgs: Vec<Msg> = std::mem::take(&mut *s.inbox.0.lock().unwrap());
-    let changed = !msgs.is_empty();
+    let changed = edited || !msgs.is_empty();
     for m in msgs {
         s.apply(m);
     }

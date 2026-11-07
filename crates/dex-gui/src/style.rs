@@ -93,6 +93,12 @@ pub fn rule(k: &Kit) -> El {
     el().w_full().h(1.0).fill(k.c.border_muted)
 }
 
+/// A structural pane divider (`border_base`): the same ink as the sidebar and pane edges, one
+/// step stronger than the in-card `rule`.
+pub fn edge(k: &Kit) -> El {
+    el().w_full().h(1.0).fill(k.c.border_base)
+}
+
 /// A filled circle of `size` points (project colours, status).
 pub fn dot(color: Color, size: f32) -> El {
     el().size(size, size).radius(size / 2.0).fill(color)

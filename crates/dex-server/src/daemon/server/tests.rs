@@ -226,6 +226,7 @@ mod handler_tests {
             plan: None,
             system_prompt: None,
             thinking_effort: None,
+            prompt_name: None,
         };
         // unknown session -> 404
         let r = chat(
@@ -1925,6 +1926,7 @@ mod permission_gate_tests {
             plan: plan.map(String::from),
             system_prompt: None,
             thinking_effort: None,
+            prompt_name: None,
         };
         let mk_mode_req = |mode: &str| ChatRequest {
             prompt: "go".into(),
@@ -1937,6 +1939,7 @@ mod permission_gate_tests {
             plan: None,
             system_prompt: None,
             thinking_effort: None,
+            prompt_name: None,
         };
 
         // 1. Client escalating to trusted against a read-only daemon: rejected.

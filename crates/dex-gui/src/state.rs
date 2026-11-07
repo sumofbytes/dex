@@ -140,6 +140,8 @@ pub struct Queued {
 /// How many command blocks the terminal keeps, and lines kept per block.
 pub const TERM_BLOCKS: usize = 100;
 pub const TERM_LINES: usize = 2000;
+/// Saved terminal commands kept.
+pub const TERM_HISTORY: usize = 1000;
 
 /// One command the terminal ran: the command, its output lines, and how it ended.
 pub struct TermBlock {
@@ -159,6 +161,14 @@ pub enum VTab {
     Changes,
     Terminal,
 }
+
+/// How far the sidebar and the viewer pane stretch when you drag their dividers. Ranges that
+/// leave the transcript room in a 1100-point window (DESIGN.md's widths are the starting
+/// points: `sidebar::tok::WIDTH` 280 and `viewer::WIDTH` 460).
+pub const SIDE_MIN: f32 = 220.0;
+pub const SIDE_MAX: f32 = 440.0;
+pub const VIEW_MIN: f32 = 340.0;
+pub const VIEW_MAX: f32 = 640.0;
 
 pub struct OpenFile {
     pub path: String,
@@ -195,6 +205,8 @@ pub struct State {
     pub current: Option<String>,
     pub items: Vec<Item>,
     pub edit: TextEdit,
+    /// The composer text as of the last poll: a change asks for one more frame (see `poll`).
+    pub edit_seen: String,
     pub busy: bool,
     pub status: String,
     pub info: Info,
@@ -204,6 +216,8 @@ pub struct State {
     pub tokens: u64,
     pub cost: f64,
     pub sidebar: bool,
+    /// The sidebar's width; its divider stretches it.
+    pub sidebar_w: f32,
     pub page: Page,
     pub queue: Vec<Queued>,
     pub search: TextEdit,
@@ -230,6 +244,8 @@ pub struct State {
     pub use_worktree: bool,
     pub confirm_discard: bool,
     pub viewer: bool,
+    /// The viewer pane's width; its divider stretches it.
+    pub viewer_w: f32,
     pub vtab: VTab,
     pub files: Vec<String>,
     pub file_filter: TextEdit,
@@ -238,6 +254,11 @@ pub struct State {
     pub scanned: Option<String>,
     pub term: Vec<TermBlock>,
     pub term_input: TextEdit,
+    /// Commands run in the terminal, oldest first, saved in the data directory.
+    pub term_history: Vec<String>,
+    /// While the input walks history: where it is and the input's text before the walk
+    /// started (the text Ctrl+R then searches for).
+    pub term_hist: Option<(usize, String)>,
     pub term_cwd: Option<String>,
     pub term_running: bool,
     pub wake: Option<Waker>,
@@ -255,6 +276,7 @@ impl Default for State {
             current: None,
             items: Vec::new(),
             edit: TextEdit::default(),
+            edit_seen: String::new(),
             busy: false,
             status: "starting…".into(),
             info: Info::default(),
@@ -264,6 +286,7 @@ impl Default for State {
             tokens: 0,
             cost: 0.0,
             sidebar: true,
+            sidebar_w: crate::sidebar::tok::WIDTH,
             page: Page::Home,
             queue: Vec::new(),
             search: TextEdit::default(),
@@ -283,6 +306,7 @@ impl Default for State {
             use_worktree: false,
             confirm_discard: false,
             viewer: false,
+            viewer_w: crate::viewer::WIDTH,
             vtab: VTab::Files,
             files: Vec::new(),
             file_filter: TextEdit::default(),
@@ -291,6 +315,8 @@ impl Default for State {
             scanned: None,
             term: Vec::new(),
             term_input: TextEdit::default(),
+            term_history: Vec::new(),
+            term_hist: None,
             term_cwd: None,
             term_running: false,
             wake: None,
@@ -711,6 +737,17 @@ impl State {
         }
     }
 
+    /// Drag the sidebar's edge `dx` from where the pointer pressed. The drag strip reverts to
+    /// `start` itself when the gesture is cancelled (Escape, the window losing focus).
+    pub fn drag_sidebar(&mut self, start: f32, dx: f32) {
+        self.sidebar_w = (start + dx).clamp(SIDE_MIN, SIDE_MAX).round();
+    }
+
+    /// Same for the viewer pane's edge, which widens as the pointer moves left (`-dx`).
+    pub fn drag_viewer(&mut self, start: f32, dx: f32) {
+        self.viewer_w = (start - dx).clamp(VIEW_MIN, VIEW_MAX).round();
+    }
+
     /// Show the viewer on `tab` (or hide it when it already shows that tab) and rescan.
     pub fn show_viewer(&mut self, tab: VTab) {
         if self.viewer && self.vtab == tab {
@@ -733,6 +770,98 @@ impl State {
         });
     }
 
+    /// Read the saved terminal command history, if there was one.
+    pub fn load_term_history(&mut self) {
+        let Some(path) = term_history_file() else {
+            return;
+        };
+        if let Ok(text) = std::fs::read_to_string(path) {
+            self.term_history = text.lines().map(str::to_string).collect();
+        }
+    }
+
+    /// Remember a command in the history (adjacent repeats dropped) and save it.
+    pub fn push_term_history(&mut self, cmd: &str) {
+        if self.term_history.last().map(String::as_str) == Some(cmd) {
+            return;
+        }
+        self.term_history.push(cmd.to_string());
+        let n = self.term_history.len();
+        if n > TERM_HISTORY {
+            self.term_history.drain(..n - TERM_HISTORY);
+        }
+        let Some(path) = term_history_file() else {
+            return;
+        };
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(path, self.term_history.join("\n"));
+    }
+
+    /// Put history entry `i` in the input, caret at the end.
+    fn recall_term(&mut self, i: usize) {
+        if let Some(t) = self.term_history.get(i) {
+            self.term_input.replace_text(t.clone());
+        }
+    }
+
+    /// Up: one step back through the history, from the input's own text.
+    pub fn term_hist_up(&mut self) {
+        if self.term_history.is_empty() {
+            return;
+        }
+        let hist = self.term_hist.take();
+        let (mut pos, draft) = match hist {
+            Some((p, d)) => (p, d),
+            None => (self.term_history.len(), self.term_input.text.clone()),
+        };
+        if pos > 0 {
+            pos -= 1;
+            let t = self.term_history[pos].clone();
+            self.term_input.replace_text(t);
+        }
+        self.term_hist = Some((pos, draft));
+    }
+
+    /// Down: forward through the history, past the newest back to the unsent text.
+    pub fn term_hist_down(&mut self) {
+        let Some((pos, draft)) = self.term_hist.take() else {
+            return;
+        };
+        match self.term_history.get(pos + 1) {
+            Some(t) => {
+                let t = t.clone();
+                self.term_hist = Some((pos + 1, draft));
+                self.term_input.replace_text(t);
+            }
+            None => {
+                self.term_input.replace_text(draft); // past the newest: back to the unsent draft
+            }
+        }
+    }
+
+    /// Ctrl+R: the most recent command containing the field's text — the text the walk started
+    /// from, once a match is shown. Again finds the next older match; an empty field behaves
+    /// like Up.
+    pub fn term_hist_search(&mut self) {
+        let (pos, query) = match &self.term_hist {
+            Some((p, q)) => (*p, q.clone()),
+            None if self.term_input.text.trim().is_empty() => {
+                self.term_hist_up();
+                return;
+            }
+            None => (self.term_history.len(), self.term_input.text.clone()),
+        };
+        if let Some(i) = (0..pos)
+            .rev()
+            .find(|&i| self.term_history[i].contains(&query))
+        {
+            self.term_hist = Some((i, query));
+            self.recall_term(i);
+        }
+    }
+
     /// Run the terminal input as a shell command in the project directory, streaming its output
     /// into a new block. Not a PTY: interactive programs (editors, pagers) do not work.
     pub fn run_term(&mut self) {
@@ -740,6 +869,8 @@ impl State {
         if cmd.is_empty() || self.term_running {
             return;
         }
+        self.term_hist = None;
+        self.push_term_history(&cmd);
         self.term_input.replace_text("");
         let dir = self.term_cwd.clone().unwrap_or_else(|| self.cwd());
         if self.term.len() >= TERM_BLOCKS {
@@ -967,6 +1098,11 @@ fn hidden_file() -> Option<std::path::PathBuf> {
     Some(crate::worktree::data_dir().join("gui-hidden.json"))
 }
 
+/// Where the terminal's command history is saved.
+fn term_history_file() -> Option<std::path::PathBuf> {
+    Some(crate::worktree::data_dir().join("gui-term-history"))
+}
+
 /// The index of the first item of each run of consecutive tool calls.
 pub fn work_run_starts(items: &[Item]) -> Vec<usize> {
     (0..items.len())
@@ -1010,12 +1146,15 @@ pub fn project_name(cwd: &str) -> String {
 }
 
 pub fn session_title(s: &SessionInfo) -> String {
+    // A chosen name wins over the first prompt, but a generated one never
+    // shows: once the original prompt is out of the transcript (`clear` then
+    // a compaction summary, which is never a title), falling back to the
+    // generated name would put `dex-gui-<rand>` strings in the sidebar.
     let t = s
         .name
         .clone()
         .filter(|n| !n.is_empty() && !s.auto_named)
         .or_else(|| s.first_prompt.clone())
-        .or_else(|| s.name.clone())
         .unwrap_or_else(|| "Untitled".into());
     t.lines()
         .next()
@@ -1159,6 +1298,51 @@ mod tests {
     }
 
     #[test]
+    fn generated_names_never_reach_the_sidebar() {
+        let sess = |name: Option<&str>, auto: bool, prompt: Option<&str>| {
+            serde_json::from_value::<SessionInfo>(serde_json::json!({
+                "session_id": "s", "path": "", "cwd": "/x", "updated_at": "",
+                "name": name, "auto_named": auto,
+                "first_prompt": prompt, "message_count": 1
+            }))
+            .unwrap()
+        };
+        // A generated name with no prompt in the transcript shows Untitled,
+        // not `dex-gui-<rand>`.
+        assert_eq!(
+            session_title(&sess(Some("dex-gui-k3m9x2q"), true, None)),
+            "Untitled"
+        );
+        // A chosen name and the first prompt still win, in that order.
+        assert_eq!(
+            session_title(&sess(Some("Fancy"), false, Some("hi there"))),
+            "Fancy"
+        );
+        assert_eq!(
+            session_title(&sess(Some("dex-gui-k3m9x2q"), true, Some("hi there"))),
+            "hi there"
+        );
+        assert_eq!(session_title(&sess(None, false, None)), "Untitled");
+    }
+
+    #[test]
+    fn pane_widths_follow_the_pointer() {
+        let mut s = State::default();
+        assert_eq!(s.sidebar_w, crate::sidebar::tok::WIDTH);
+        assert_eq!(s.viewer_w, crate::viewer::WIDTH);
+        s.drag_sidebar(s.sidebar_w, 60.0);
+        assert_eq!(s.sidebar_w, 340.0);
+        s.drag_sidebar(s.sidebar_w, 400.0); // clamped at the stretch limit
+        assert_eq!(s.sidebar_w, SIDE_MAX);
+        s.drag_sidebar(s.sidebar_w, -600.0); // clamped at the collapse limit
+        assert_eq!(s.sidebar_w, SIDE_MIN);
+        s.drag_viewer(s.viewer_w, -80.0); // the pointer moves left: the pane widens
+        assert_eq!(s.viewer_w, 540.0);
+        s.drag_viewer(s.viewer_w, -600.0); // clamped at the stretch limit
+        assert_eq!(s.viewer_w, VIEW_MAX);
+    }
+
+    #[test]
     fn tool_calls_group_into_runs() {
         let tool = || {
             Item::Tool(ToolRun {
@@ -1250,5 +1434,53 @@ mod tests {
         assert_eq!(s.term.len(), 1);
         assert_eq!(s.term[0].lines, ["hi", "err"]);
         assert!(matches!(s.term[0].status, TermStatus::Done { code: 0, .. }));
+    }
+
+    #[test]
+    fn terminal_input_walks_history() {
+        let mut s = State::default();
+        s.push_term_history("echo a");
+        s.push_term_history("echo a"); // adjacent repeat dropped
+        s.push_term_history("echo b");
+        assert_eq!(s.term_history, ["echo a", "echo b"]);
+        s.term_input.replace_text("echo c");
+        s.term_hist_up();
+        assert_eq!(s.term_input.text, "echo b");
+        s.term_hist_up();
+        assert_eq!(s.term_input.text, "echo a");
+        s.term_hist_up(); // oldest entry: no further step
+        assert_eq!(s.term_input.text, "echo a");
+        s.term_hist_down();
+        assert_eq!(s.term_input.text, "echo b");
+        s.term_hist_down(); // past the newest: back to the unsent draft
+        assert_eq!(s.term_input.text, "echo c");
+    }
+
+    #[test]
+    fn terminal_input_searches_history() {
+        let mut s = State::default();
+        for c in ["cargo build", "cargo test", "git status"] {
+            s.push_term_history(c);
+        }
+        s.term_input.replace_text("test");
+        s.term_hist_search();
+        assert_eq!(s.term_input.text, "cargo test");
+        s.term_hist_search(); // no older match containing "test": the field keeps it
+        assert_eq!(s.term_input.text, "cargo test");
+        s.term_hist_search(); // the query is the pre-search text, not the shown command
+        assert_eq!(s.term_input.text, "cargo test");
+    }
+
+    #[test]
+    fn terminal_search_walks_older_matches() {
+        let mut s = State::default();
+        for c in ["cargo build", "cargo test one", "cargo test two"] {
+            s.push_term_history(c);
+        }
+        s.term_input.replace_text("test");
+        s.term_hist_search();
+        assert_eq!(s.term_input.text, "cargo test two");
+        s.term_hist_search();
+        assert_eq!(s.term_input.text, "cargo test one");
     }
 }

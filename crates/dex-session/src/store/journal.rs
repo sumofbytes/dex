@@ -129,10 +129,10 @@ impl Session {
     }
 
     /// `scan_summary` plus the first user prompt, taken in the same pass: the
-    /// first line of the first user message still in the transcript (a `clear`
-    /// forgets it), at most `TITLE_CHARS` characters. A resume picker titles
-    /// the session with it. The newest `session_info` rename rides along in
-    /// the same pass (see `Listing.session_name`).
+    /// first line of the first name-tag-free user message still in the
+    /// transcript (a `clear` forgets it), at most `TITLE_CHARS` characters.
+    /// A resume picker titles the session with it. The newest `session_info`
+    /// rename rides along in the same pass (see `Listing.session_name`).
     pub fn scan_listing(path: &Path) -> io::Result<Listing> {
         let mut first_prompt: Option<String> = None;
         let mut summary_body: Option<String> = None;
@@ -181,12 +181,16 @@ impl Session {
                         match serde_json::from_value::<ChatMessage>(value) {
                             Ok(msg) if msg.role != Role::System => {
                                 count += 1;
-                                // The compaction summary and plan-mode notes are user
-                                // messages too, but not prompts.
+                                // The first user message with no `name` tag titles
+                                // the session. Tagged user messages are system
+                                // artifacts, not typed prompts — the compaction
+                                // summary, plan-mode notes, loaded skills, and the
+                                // `agent-notifications` drain (the "[task task-1]
+                                // finished, ..." line, journaled ahead of a wake
+                                // turn's prompt) must never become the title.
                                 if first_prompt.is_none()
                                     && msg.role == Role::User
-                                    && msg.name.as_deref() != Some("summary")
-                                    && !msg.is_plan_mode_note()
+                                    && msg.name.is_none()
                                 {
                                     first_prompt = msg.content.as_deref().and_then(prompt_title);
                                 }

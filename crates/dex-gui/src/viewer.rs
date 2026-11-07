@@ -113,7 +113,7 @@ pub fn viewer(s: &State, k: &Kit) -> El {
     };
     col()
         .key("viewer")
-        .w(WIDTH)
+        .w(s.viewer_w)
         .h_full()
         .fill(k.c.page)
         .child(bar)
@@ -341,6 +341,25 @@ fn terminal(s: &State, k: &Kit) -> El {
                 .single_line()
                 .on_edit(|s: &mut State| &mut s.term_input)
                 .on_submit(|s: &mut State, _| s.run_term())
+                .on_input_key(|s: &mut State, e: &rune::KeyEvent, _| match &e.key {
+                    rune::Key::Up
+                        if !e.mods.shift && !e.mods.cmd && !e.mods.alt && !e.mods.ctrl =>
+                    {
+                        s.term_hist_up();
+                        true
+                    }
+                    rune::Key::Down
+                        if !e.mods.shift && !e.mods.cmd && !e.mods.alt && !e.mods.ctrl =>
+                    {
+                        s.term_hist_down();
+                        true
+                    }
+                    _ if e.is_command('r') => {
+                        s.term_hist_search();
+                        true
+                    }
+                    _ => false,
+                })
                 .grow(1.0)
                 .min_w(0.0),
         )
@@ -366,11 +385,11 @@ fn terminal(s: &State, k: &Kit) -> El {
                 .gap(space::MD)
                 .pb(space::MD)
                 .child(input)
-                .child(
-                    text("One-shot commands · no interactive programs")
-                        .font(typo::caption(k))
-                        .color(k.c.text_faint),
-                ),
+                  .child(
+                      text("One-shot commands · up for history · Ctrl+R searches · no interactive programs")
+                          .font(typo::caption(k))
+                          .color(k.c.text_faint),
+                  ),
         )
 }
 

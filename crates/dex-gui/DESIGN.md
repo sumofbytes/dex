@@ -53,10 +53,10 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 ## Radius and spacing
 
 - Radius: rows 8px, code blocks 10px, cards 12px, bubbles 12px, composer and dialogs 14px, pills 999px.
-- Sidebar: 280px wide, padding 14px 8px, rows 8px 10px. Thread rows under a project indent 14px.
+- Sidebar: 280px wide, padding 14px 8px, rows 8px 10px. Every row is on one grid; hierarchy comes from type, not indent.
 - Spacing scale (`src/style.rs::space`): XXS 2, XS 4, SM 6, MD 8, LG 10, XL 12, XXL 16. Gaps and paddings use these names; layout one-offs (14, 18, 20, 48 …) stay literal.
 - Header: 48px tall, padding 0 16px.
-- Transcript column: 760px max inside a 16px gutter, gap 16px, centred. One content line runs 12px inside the composer card's edge (card padding 4 + 8 in the elements): reply, thought, tool rows, the user bubble's right edge, the input text, the option chips' icon and text, the send button's right edge and the footer all start and end on it (left x = card + 12, right x = card right - 12). The queued-message boxes span the full card width.
+- Transcript column: 760px max inside a 16px gutter, gap 16px, centred. One content line runs 12px inside the composer card's edge (card padding 4 + 8 in the elements): reply, thought, tool rows, the user bubble's right edge, the input text, the option chips' icon and text, the send button's right edge and the footer all start and end on it (left x = card + 12, right x = card right - 12). Work-block head rows and their Stop control keep 8px inside their band instead — they are chrome rows with a hover/header fill, not reading text — and what opens under a head sits on the head's text column (26 in), not on the content line. The queued-message boxes span the full card width.
 - Home: padding 40px 48px, gap 28px. Stat cards: four equal columns, gap 12px.
 - Viewer: 460px wide. Tabs row 48px, padding 0 12px.
 
@@ -74,11 +74,13 @@ Paper variables are not set through the MCP (a CSS variable on a parent does not
 
 One grid (`src/sidebar.rs::tok`, board "dex / Sidebar v3 · grid"). Width 280, margin 12, row padding 10, so content spans x 22..258. Every row is 32 tall and built from the same chrome.
 
-- Lead column x 22..38 (centre 30): nav icon (16), project colour dot (6) or spinner (8), a running thread's spinner (8) or attention dot.
+- Lead column x 22..38: nav icon (16), a project's folder icon (16) and a thread's status dot (6)
+  or spinner (16, like the folder icon) start flush at x 22 — the same edge the NEEDS YOU and PROJECTS
+  labels start on.
 - Text column starts x 46 (lead 16 + gap 8): nav label, project name, thread title, "Show more". Hierarchy is by type (small bold caps for projects, regular text for threads), not indent.
 - Trailing: a 24 time column, right edge x 230 (one 8 gap left of the slot); a 20 slot centred x 248 holding + on a project header and × on a hovered thread; the "Ctrl N" hint right-aligned to x 258.
 - Brand "dex" at x 22, 14px weight 600. Nav labels 12px weight 500; selected row fill #433b3b, radius 8. Thread titles 12px, selected weight 500. Project names 10px caps. Times and hint mono 12.
-- The whole project header toggles collapse (no chevron); × (hide) shows on hover only. The 8px lead holds the dot, or a spinner while a thread in the project runs. Titles truncate with an ellipsis.
+- The whole project header toggles collapse (no chevron); × (hide) shows on hover only. The 16px lead holds a static folder icon in the project colour — it never shows a spinner; a running thread's spinner lives on its own row. Titles truncate with an ellipsis.
 - A double-click on a thread row edits its title in place: the title becomes a single-line field with the text selected, Return sends the rename to the daemon (`POST /api/sessions/{id}/name`), Escape or a press elsewhere keeps the old title.
 
 ## Composer options
@@ -148,8 +150,8 @@ Stroke icons on a 24px grid, stroke 1.6, round caps and joins, drawn as inline S
 Every run of thoughts and tool calls between two messages folds into one block (a run ends at an assistant message, a user message or an error).
 
 - Done, collapsed (default): `› Worked for 14s  2 thoughts · 5 commands`, a 12px faint row (duration is the sum of thought and tool times, omitted under 1s; a zero count is omitted). The reply follows 20 below.
-- Done, expanded: chevron down; the rows nest 14 in, in order. A thought is a `› Thought · 4s` row that opens by itself to 12px / 18 faint text (indented 14); tool rows are unchanged (`bash: cmd`, time, dimmed `↳` output).
-- Live: spinner + "Working · 9s" (12px medium, muted), always open; folds when the reply starts.
+- Done, expanded: chevron down; the row takes the hover colour as a static header band (collapsed, it is hover-only); the rows nest 26 in, in order — on the head's text column, so tool names and a thought's chevron sit under the head's label. A thought is a `› Thought · 4s` row that opens by itself to 12px / 18 faint text (indented 18 under its own chevron, flush with its label); tool rows are unchanged (`bash: cmd`, time, dimmed `↳` output).
+- Live: the spinner takes the chevron's place — `⟳ Working · 9s` (12px medium, muted) — so its label sits on the same column as the done row's; same collapsibility, collapsed by default; expansion survives into the done row. Stop sits at the right end.
 - Ctrl+O opens or closes every block and tool row; Ctrl+T every thought. Rhythm: 16 between blocks, 32 around a user message, 20 from the block to the reply.
 
 ## Needs you
@@ -158,4 +160,4 @@ Penpot board "dex / Sidebar v4 · needs you". A NEEDS YOU caps label and rows si
 
 - Amber dot: an approval or a question is waiting on you (the row shows the prompt). Green: a background turn finished while the thread was not open. Red: it failed.
 - A row leaves the list when you open the thread. The thread stays under its project as well.
-- A thread whose turn runs in the background keeps its spinner under its project (and on the project header), however many threads run at once. Starting a new thread or opening another one does not stop a running turn.
+- A thread whose turn runs in the background keeps its spinner under its project, however many threads run at once. Starting a new thread or opening another one does not stop a running turn. The project header never shows a spinner.
