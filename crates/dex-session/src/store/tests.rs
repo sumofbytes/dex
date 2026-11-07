@@ -505,6 +505,39 @@ fn scan_listing_skips_summaries_and_cuts_long_titles() {
     let _ = fs::remove_file(&path);
 }
 
+/// Mid-turn compaction (`rewrite_messages`) replaces the head of the
+/// transcript — the original prompt with it — by one `summary` checkpoint.
+/// The sidebar must not flip that still-auto-named thread to "Untitled" at
+/// the post-turn listing refresh: the checkpoint's Goal line titles it.
+#[test]
+fn scan_listing_titles_from_the_compaction_checkpoint() {
+    let path = unique_path("dex-scan-compaction");
+    let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+    let summary = format!(
+        r#"{{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","name":"summary","content":"{}"}}"#,
+        "## Goal\\nFix the race in the sidebar titling\\n\\n## Progress\\n### Done\\n- [x] found it"
+    );
+    let assistant = r#"{"type":"message","id":"2","timestamp":"2020-01-01T00:00:00Z","role":"assistant","content":"on it"}"#;
+    fs::write(&path, format!("{header}\n{summary}\n{assistant}\n")).unwrap();
+    let listing = Session::scan_listing(&path).unwrap();
+    assert_eq!(listing.message_count, 2);
+    assert_eq!(
+        listing.first_prompt.as_deref(),
+        Some("Fix the race in the sidebar titling")
+    );
+    // A later real prompt still wins over the checkpoint.
+    let user = r#"{"type":"message","id":"3","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"now the tests"}"#;
+    fs::write(&path, format!("{header}\n{summary}\n{assistant}\n{user}\n")).unwrap();
+    assert_eq!(
+        Session::scan_listing(&path)
+            .unwrap()
+            .first_prompt
+            .as_deref(),
+        Some("now the tests")
+    );
+    let _ = fs::remove_file(&path);
+}
+
 #[test]
 fn scan_listing_skips_plan_mode_notes() {
     let path = unique_path("dex-scan-plan-note");
