@@ -1,0 +1,21 @@
+[package]
+name = "dex-gui"
+version = "0.0.0"
+edition = "2024"
+description = "Spike: native GUI client for the dex daemon, built on Rune"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Standalone workspace: Rune is pre-release and pulls a large GPU/windowing
+# tree, so it stays out of dex's workspace, lockfile and CI.
+[workspace]
+
+[dependencies]
+dex-client = { path = "../dex-client" }
+dex-server = { path = "../dex-server" }
+rune = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50" }
+rune-kit = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", features = ["markdown"] }
+rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50" }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }

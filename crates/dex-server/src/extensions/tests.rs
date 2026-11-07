@@ -1460,8 +1460,18 @@ end
 }
 
 /// `dex.wrap` on a non-wrappable slot fails legibly at load.
-#[test]
-fn wrap_rejects_non_wrappable_slots() {
+#[allow(clippy::await_holding_lock)] // single-threaded runtime; env must stay redirected
+#[tokio::test]
+async fn wrap_rejects_non_wrappable_slots() {
+    // reset_for_tests drops every engine and LAST_MODEL: unguarded, this
+    // wipes the state a concurrent fixtured test is running against. Hold
+    // the global locks in the consistent order (sessions -> turn ->
+    // manager) like every other fixtured test.
+    let _sessions = crate::daemon::state::lock_map(&crate::test_env::TEST_SESSIONS_ENV_LOCK);
+    let _turn = crate::agent::turn_loop::tests::TEST_TURN_ENV_LOCK
+        .lock()
+        .await;
+    let _ext = TEST_GLOBAL_MANAGER_LOCK.lock().await;
     let manifest = "manifest_version: 1\nid: mw-bad\nversion: 0.1.0\ncapabilities: []\n";
     let root = fixture_exts(&[(
         "mw-bad",
@@ -1471,19 +1481,16 @@ fn wrap_rejects_non_wrappable_slots() {
 end
 "#,
     )]);
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let mgr = global_manager();
-        mgr.reset_for_tests().await;
-        mgr.refresh_with(std::slice::from_ref(&root)).await;
-        // A rejected extension never enters the engine map: its middleware
-        // would otherwise run against a slot it never consented to.
-        assert!(
-            !mgr.engines.read().await.contains_key("mw-bad"),
-            "non-wrappable slot must fail at load"
-        );
-        mgr.reset_for_tests().await;
-    });
+    let mgr = global_manager();
+    mgr.reset_for_tests().await;
+    mgr.refresh_with(std::slice::from_ref(&root)).await;
+    // A rejected extension never enters the engine map: its middleware
+    // would otherwise run against a slot it never consented to.
+    assert!(
+        !mgr.engines.read().await.contains_key("mw-bad"),
+        "non-wrappable slot must fail at load"
+    );
+    mgr.reset_for_tests().await;
     std::fs::remove_dir_all(&root).ok();
 }
 

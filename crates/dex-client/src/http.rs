@@ -424,6 +424,7 @@ impl DaemonClient {
                 plan: options.plan,
                 system_prompt: options.system_prompt,
                 thinking_effort: options.thinking_effort,
+                prompt_name: None,
             })
             .send()
             .await

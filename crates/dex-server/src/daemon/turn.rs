@@ -701,8 +701,14 @@ pub(crate) async fn run_turn_inner(
     // `@path` mentions expand here, not in the journaled `UserPrompt`, so the
     // transcript shows what the user typed while the model gets the contents.
     let mut mention_bytes = 0;
-    let user_message =
+    // System-initiated prompts (the idle wake) carry a journal/UI tag so the
+    // session listing never titles a thread with boilerplate; the wire never
+    // sees `name` (pre-existing mechanism).
+    let mut user_message =
         ChatMessage::user(crate::tools::expand_mentions(&req.prompt, &mut mention_bytes).await);
+    if let Some(tag) = req.prompt_name.as_deref() {
+        user_message.name = Some(tag.to_string());
+    }
     // §10b V1a: completion notices queued while no turn was live drain at
     // the next real turn boundary — the start of this one. They ride the
     // LLM context as a user-role message, never the steering channel.

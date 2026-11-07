@@ -138,6 +138,12 @@ pub struct ChatRequest {
     /// omit it and the daemon falls back to its own env/file layers.
     #[serde(default)]
     pub system_prompt: Option<String>,
+    /// Journal/UI tag for system-initiated prompts (the idle wake sets
+    /// `"wake"`); user-typed prompts leave it unset. Rides the same local
+    /// `name` tag channel as `summary`/`agent-notifications` — stripped
+    /// from the wire, never shown as the user's words.
+    #[serde(default)]
+    pub prompt_name: Option<String>,
     /// Per-turn reasoning effort override from a remote `/thinking` choice.
     /// `None` (older clients omit it) uses the daemon default; `Some("")`
     /// is an explicit clear (unset, ignoring env); otherwise the level.
@@ -913,6 +919,7 @@ mod tests {
         assert!(req.permission.is_none());
         assert!(req.headers.is_none());
         assert!(req.thinking_effort.is_none());
+        assert!(req.prompt_name.is_none());
     }
 
     #[test]

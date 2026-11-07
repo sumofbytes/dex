@@ -538,6 +538,35 @@ fn scan_listing_titles_from_the_compaction_checkpoint() {
     let _ = fs::remove_file(&path);
 }
 
+/// A background task's `[task …] finished, …` notice rides a named
+/// `agent-notifications` user message journaled ahead of the wake turn's
+/// prompt: closing the window with such a task running could make the very
+/// first tag message in the transcript be the notice, and the resume
+/// picker / sidebar would title the thread with it.
+#[test]
+fn scan_listing_never_titles_from_tagged_user_messages() {
+    let path = unique_path("dex-scan-notifications");
+    let header = r#"{"type":"session","version":1,"id":"x","timestamp":"2020-01-01T00:00:00Z","cwd":"/tmp"}"#;
+    let notice = r#"{"type":"message","id":"1","timestamp":"2020-01-01T00:00:00Z","role":"user","name":"agent-notifications","content":"[task task-1] finished, exit 0: sleep 30"}"#;
+    let wake = r#"{"type":"message","id":"2","timestamp":"2020-01-01T00:00:00Z","role":"user","name":"wake","content":"A background task or agent finished while this session was idle."}"#;
+    // Wake-only transcript: nothing to title (no Untitled-able prompt).
+    fs::write(&path, format!("{header}\n{notice}\n{wake}\n")).unwrap();
+    let listing = Session::scan_listing(&path).unwrap();
+    assert_eq!(listing.message_count, 2);
+    assert_eq!(listing.first_prompt, None);
+    // The next real prompt titles the thread, as expected.
+    let user = r#"{"type":"message","id":"3","timestamp":"2020-01-01T00:00:00Z","role":"user","content":"explain the failure"}"#;
+    fs::write(&path, format!("{header}\n{notice}\n{wake}\n{user}\n")).unwrap();
+    assert_eq!(
+        Session::scan_listing(&path)
+            .unwrap()
+            .first_prompt
+            .as_deref(),
+        Some("explain the failure")
+    );
+    let _ = fs::remove_file(&path);
+}
+
 #[test]
 fn scan_listing_skips_plan_mode_notes() {
     let path = unique_path("dex-scan-plan-note");

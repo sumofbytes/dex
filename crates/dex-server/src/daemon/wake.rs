@@ -145,6 +145,7 @@ pub(crate) fn schedule_idle_wake(state: Arc<DaemonState>, session_id: String) {
                 .unwrap_or((None, None));
             let request = ChatRequest {
                 prompt: WAKE_PROMPT.to_string(),
+                prompt_name: Some("wake".to_string()),
                 skill_dirs: Vec::new(),
                 base_url,
                 model,
