@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 use crate::agent::delegate::{AgentEvent, AgentManager};
-use crate::protocol::{ApprovalDecision, PermissionMode, QuestionAnswer, QueueMsg};
+use crate::protocol::{ApprovalDecision, PermissionMode, QuestionAnswer};
 use crate::protocol::{StreamEnvelope, StreamEvent};
 use crate::runtime::console::CancellationToken;
 
@@ -84,27 +84,17 @@ pub struct DaemonState {
     /// client in the `QuestionRequired` stream event). The sender resolves
     /// the blocking `tool_ask_user` call inside the agent loop.
     pub pending_questions: Mutex<HashMap<String, PendingQuestion>>,
-    /// Sessions with a turn currently in flight; one turn at a time per
-    /// session keeps the append-only session log consistent.
-    pub active_turns: Mutex<HashSet<String>>,
-    /// Per-session cancellation tokens for in-flight turns. POST /cancel
-    /// signals the token so this turn unwinds without touching other
-    /// sessions; the entry is removed when the turn finishes.
-    pub(crate) cancel_tokens: Mutex<HashMap<String, CancellationToken>>,
+    /// Per-session turn slot: present while a turn (or a claim standing in
+    /// for one) is in flight. One turn at a time per session keeps the
+    /// append-only session log consistent. Phases and teardown rules live in
+    /// `slot.rs`; it holds the cancel token and the steering/follow-up queue
+    /// senders that used to be separate maps.
+    pub(crate) turns: Mutex<HashMap<String, super::slot::Slot>>,
     /// Per-session cancellation tokens for in-flight `!` shell runs (Esc
     /// cancels a running bash). POST /cancel signals these too; the
     /// entry is removed when the run finishes. At most one run per session
     /// (a second `POST /shell` while one is registered is 409).
     pub(crate) shell_tokens: Mutex<HashMap<String, CancellationToken>>,
-    /// Per-session steering queue: `POST /steer` pushes a `Content` into the
-    /// turn's `steering_rx` (consumed inside `process_turn` between
-    /// iterations); `POST /recall` pushes a `Recall` that cancels a not-yet-
-    /// injected item.
-    pub steering_txs: Mutex<HashMap<String, mpsc::Sender<QueueMsg>>>,
-    /// Per-session follow-up queue: `POST /followup` pushes a `Content` into a
-    /// turn's outer loop (`run_agent_turn`) which chains a new `process_turn`
-    /// iteration without a new HTTP request; `POST /recall` pushes a `Recall`.
-    pub followup_txs: Mutex<HashMap<String, mpsc::Sender<QueueMsg>>>,
     /// Per-session next event sequence number (P10) for the SSE journal,
     /// seeded from disk on startup so replays stay consistent across restarts.
     pub event_seqs: Mutex<HashMap<String, u64>>,
@@ -197,11 +187,8 @@ impl DaemonState {
             ceiling: crate::llm::config::permission_from_env().unwrap_or(PermissionMode::Ask),
             pending_approvals: Mutex::new(HashMap::new()),
             pending_questions: Mutex::new(HashMap::new()),
-            active_turns: Mutex::new(HashSet::new()),
-            cancel_tokens: Mutex::new(HashMap::new()),
+            turns: Mutex::new(HashMap::new()),
             shell_tokens: Mutex::new(HashMap::new()),
-            steering_txs: Mutex::new(HashMap::new()),
-            followup_txs: Mutex::new(HashMap::new()),
             event_seqs: Mutex::new(HashMap::new()),
             idempotency: Mutex::new(HashMap::new()),
             session_approvals: Mutex::new(HashMap::new()),
@@ -589,7 +576,7 @@ impl DaemonState {
             ));
         }
         for (id, path) in &interrupted {
-            let live = lock_map(&self.active_turns).contains(id);
+            let live = self.turn_active(id);
             if live {
                 continue;
             }

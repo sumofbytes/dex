@@ -367,7 +367,7 @@ async fn rebuild_skips_failed_marking_for_live_turns() {
     drop(s);
 
     let state = DaemonState::new();
-    state.active_turns.lock().unwrap().insert(id.clone());
+    assert!(state.claim_turn(&id));
     state.rebuild_async().await;
     // Still registered, but the live turn is untouched.
     assert!(state.sessions.lock().unwrap().contains_key(&id));

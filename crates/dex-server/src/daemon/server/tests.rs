@@ -568,7 +568,8 @@ mod handler_tests {
         assert!(matches!(r, Err(StatusCode::CONFLICT)));
         // With an active queue the recall lands as `Recall` on that channel.
         let (tx, mut rx) = mpsc::channel::<QueueMsg>(4);
-        state.steering_txs.lock().unwrap().insert("s".into(), tx);
+        let (other, _other_rx) = mpsc::channel::<QueueMsg>(4);
+        state.seed_streaming("s", tx, other);
         let r = recall(
             State(state.clone()),
             Path("s".into()),
@@ -613,10 +614,7 @@ mod handler_tests {
             state.cancel_wake("s-a").is_none(),
             "the stolen wake is gone"
         );
-        assert!(
-            state.active_turns.lock().unwrap().contains("s-a"),
-            "the user turn holds the slot"
-        );
+        assert!(state.turn_active("s-a"), "the user turn holds the slot");
     }
 
     #[tokio::test]
@@ -624,22 +622,16 @@ mod handler_tests {
         // No wake to steal and a turn holds the slot: the chat POST must
         // lose here too — it retries, it never force-breaks a live turn.
         let state = Arc::new(DaemonState::new());
-        state.active_turns.lock().unwrap().insert("s-a".to_string());
+        assert!(state.claim_turn("s-a"));
         assert!(!steal_wake_and_claim(&state, "s-a").await);
-        assert!(
-            state.active_turns.lock().unwrap().contains("s-a"),
-            "the live turn keeps the slot"
-        );
+        assert!(state.turn_active("s-a"), "the live turn keeps the slot");
     }
 
     #[tokio::test]
     async fn steal_wake_and_claim_claims_a_free_slot() {
         let state = Arc::new(DaemonState::new());
         assert!(steal_wake_and_claim(&state, "s-a").await);
-        assert!(
-            state.active_turns.lock().unwrap().contains("s-a"),
-            "the slot is claimed"
-        );
+        assert!(state.turn_active("s-a"), "the slot is claimed");
     }
 
     #[tokio::test]
@@ -1191,8 +1183,7 @@ mod handler_tests {
         );
         let (stx, mut srx) = mpsc::channel::<QueueMsg>(4);
         let (ftx, mut frx) = mpsc::channel::<QueueMsg>(4);
-        state.steering_txs.lock().unwrap().insert("s".into(), stx);
-        state.followup_txs.lock().unwrap().insert("s".into(), ftx);
+        state.seed_streaming("s", stx, ftx);
         // Content is trimmed before it lands on the queue.
         let r = steer(
             State(state.clone()),
@@ -1239,7 +1230,8 @@ mod handler_tests {
             },
         );
         let (tx, mut rx) = mpsc::channel::<QueueMsg>(4);
-        state.followup_txs.lock().unwrap().insert("s".into(), tx);
+        let (other, _other_rx) = mpsc::channel::<QueueMsg>(4);
+        state.seed_streaming("s", other, tx);
         let r = recall(
             State(state),
             Path("s".into()),
@@ -1258,11 +1250,7 @@ mod handler_tests {
         let state = Arc::new(DaemonState::new());
         let turn = CancellationToken::new();
         let shell = CancellationToken::new();
-        state
-            .cancel_tokens
-            .lock()
-            .unwrap()
-            .insert("s".into(), turn.clone());
+        state.set_turn_cancel("s", turn.clone());
         state
             .shell_tokens
             .lock()
@@ -1831,7 +1819,7 @@ not json
         // A rename during a streamed turn is refused: the rewrite replaces
         // the file's inode and the turn's own journal handle would keep
         // appending into the old one (409 = retry when the turn ends).
-        state.active_turns.lock().unwrap().insert(id.clone());
+        assert!(state.claim_turn(&id));
         let r = session_name(State(state), Path(id), Json(json!({"name": "fancier"}))).await;
         assert!(
             matches!(r, Err(StatusCode::CONFLICT)),
