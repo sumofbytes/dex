@@ -70,6 +70,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+      - name: Install GUI link dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q libxkbcommon-dev
       - name: Build
         shell: bash
         # `gui`: bare `dex` opens the GUI, `dex tui` the TUI — one binary.

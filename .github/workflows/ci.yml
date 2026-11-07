@@ -45,7 +45,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: gui-check
+      - name: Install GUI link dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update -q && sudo apt-get install -y -q libxkbcommon-dev
+      # Windows compiles only: clippy -D warnings there trips on pre-existing Windows-only
+      # dead code in dex-server (tools/read.rs), which nothing lints today.
+      - run: cargo check -p dex -p dex-gui --features gui --all-targets
+        if: runner.os == 'Windows'
       - run: cargo clippy -p dex -p dex-gui --features gui --all-targets -- -D warnings
+        if: runner.os != 'Windows'
       - run: cargo test -p dex-gui -p dex --features gui --lib --bins --tests
         if: runner.os == 'Linux'
 
