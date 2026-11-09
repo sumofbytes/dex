@@ -193,6 +193,7 @@ pub fn spawn(inbox: Arc<Inbox>, wake: Waker, mut rx: mpsc::UnboundedReceiver<Cmd
                     }
                     cmd @ (Cmd::Cancel
                     | Cmd::Approve { .. }
+                    | Cmd::Answer { .. }
                     | Cmd::Steer(_)
                     | Cmd::Followup(_)
                     | Cmd::Recall { .. }) => {
@@ -290,6 +291,9 @@ async fn run_turn(
             cmd = rx.recv() => match cmd {
                 Some(Cmd::Approve { request_id, decision }) => {
                     let _ = client.approve_async(id, &request_id, decision).await;
+                }
+                Some(Cmd::Answer { request_id, answers }) => {
+                    let _ = client.answer_async(id, &request_id, answers).await;
                 }
                 Some(Cmd::Cancel) => { let _ = client.cancel_async(id).await; }
                 Some(Cmd::Steer(text)) => { let _ = client.steer_async(id, &text).await; }

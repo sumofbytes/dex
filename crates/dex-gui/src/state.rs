@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
-use dex_client::protocol::{ApprovalDecision, SessionInfo, StreamEvent};
+use dex_client::protocol::{ApprovalDecision, Question, QuestionAnswer, SessionInfo, StreamEvent};
 use rune::{TextEdit, Waker};
 use rune_kit::diff::{DiffState, parse};
 use tokio::sync::mpsc;
@@ -38,6 +38,11 @@ pub enum Cmd {
     Approve {
         request_id: String,
         decision: ApprovalDecision,
+    },
+    /// Answer the parked `ask_user` batch (`answers[i]` ↔ its `questions[i]`).
+    Answer {
+        request_id: String,
+        answers: Vec<QuestionAnswer>,
     },
 }
 
@@ -123,6 +128,16 @@ pub enum Item {
         name: String,
         input: String,
         decided: Option<ApprovalDecision>,
+    },
+    Question {
+        request_id: String,
+        questions: Vec<Question>,
+        /// Toggled option indices per question (pick order kept): `Choice`
+        /// for a single-select slot, `Multi` for a checkbox one.
+        picks: Vec<Vec<usize>>,
+        /// Set once the `ask_user` tool result lands or the turn fails:
+        /// what the slots resolved to, so the picker is no longer live.
+        decided: Option<String>,
     },
 }
 
@@ -336,6 +351,29 @@ impl Default for State {
 }
 
 impl State {
+    /// Clicking an option of the transcript question at item `i`: single-select
+    /// questions replace the pick; `multiSelect` ones toggle it (pick order kept).
+    pub fn pick_question(&mut self, i: usize, q: usize, o: usize) {
+        let Some(Item::Question {
+            picks, questions, ..
+        }) = self.items.get_mut(i)
+        else {
+            return;
+        };
+        let multi = questions.get(q).is_some_and(|x| x.multi_select);
+        if multi {
+            let slot = &mut picks[q];
+            match slot.iter().position(|&x| x == o) {
+                Some(p) => {
+                    slot.remove(p);
+                }
+                None => slot.push(o),
+            }
+        } else {
+            picks[q] = vec![o];
+        }
+    }
+
     pub fn send_cmd(&self, c: Cmd) {
         if let Some(tx) = &self.cmds {
             let _ = tx.send(c);
@@ -561,10 +599,12 @@ impl State {
             Msg::Opened { id, replay } => {
                 // Leaving a thread that still has an unanswered approval keeps it in NEEDS YOU.
                 let old = self.current.clone().filter(|o| !o.is_empty() && *o != id);
-                let unanswered = self
-                    .items
-                    .iter()
-                    .any(|i| matches!(i, Item::Approval { decided: None, .. }));
+                let unanswered = self.items.iter().any(|i| {
+                    matches!(
+                        i,
+                        Item::Approval { decided: None, .. } | Item::Question { decided: None, .. }
+                    )
+                });
                 if let Some(old) = old
                     && unanswered
                     && self.running.contains(&old)
@@ -703,6 +743,8 @@ impl State {
                 duration,
                 id,
             } => {
+                let is_ask = name == "ask_user" && !summary.is_empty();
+                let ask_summary = summary.clone();
                 let done = ToolDone {
                     summary,
                     ok: success,
@@ -728,6 +770,15 @@ impl State {
                         open: false,
                     })),
                 }
+                if is_ask
+                    && let Some(Item::Question { decided, .. }) =
+                        self.items.iter_mut().rev().find_map(|it| match it {
+                            Item::Question { decided, .. } if decided.is_none() => Some(it),
+                            _ => None,
+                        })
+                {
+                    *decided = Some(ask_summary);
+                }
             }
             StreamEvent::ApprovalRequired {
                 request_id,
@@ -739,6 +790,19 @@ impl State {
                     request_id,
                     name,
                     input,
+                    decided: None,
+                });
+            }
+            StreamEvent::QuestionRequired {
+                request_id,
+                questions,
+                ..
+            } => {
+                let picks = vec![Vec::new(); questions.len()];
+                self.items.push(Item::Question {
+                    request_id,
+                    questions,
+                    picks,
                     decided: None,
                 });
             }
@@ -769,6 +833,15 @@ impl State {
                 self.finish_stream();
                 self.sending = false;
                 self.status = "ready".into();
+                // A failed turn's parked `ask_user` never produces a tool
+                // result: close its unanswered pickers too.
+                for it in &mut self.items {
+                    if let Item::Question { decided, .. } = it
+                        && decided.is_none()
+                    {
+                        *decided = Some("No answer".into());
+                    }
+                }
                 self.items.push(Item::Error(error));
             }
             _ => {}
@@ -1152,6 +1225,20 @@ pub fn is_work(it: &Item) -> bool {
     matches!(it, Item::Thinking { .. } | Item::Tool(_))
 }
 
+/// A transcript question's POST payload: `answers[i]` ↔ its `questions[i]`;
+/// an untouched slot dismisses.
+pub fn question_answers(questions: &[Question], picks: &[Vec<usize>]) -> Vec<QuestionAnswer> {
+    questions
+        .iter()
+        .zip(picks)
+        .map(|(q, pick)| match pick.as_slice() {
+            [only, ..] if !q.multi_select => QuestionAnswer::Choice(*only),
+            [] => QuestionAnswer::Dismiss,
+            _ => QuestionAnswer::Multi(pick.clone()),
+        })
+        .collect()
+}
+
 /// What a run of work items did: `(thoughts, commands, seconds)`. Seconds add the finished
 /// thoughts' and tool calls' own durations.
 pub fn work_summary(items: &[Item]) -> (usize, usize, f64) {
@@ -1520,4 +1607,106 @@ mod tests {
         s.term_hist_search();
         assert_eq!(s.term_input.text, "cargo test one");
     }
+}
+
+#[test]
+fn questions_fold_pick_and_answer() {
+    use dex_client::protocol::{Question, QuestionOption};
+    let q = |multi: bool| Question {
+        question: "Which database?".into(),
+        header: "Database".into(),
+        options: vec![
+            QuestionOption {
+                label: "postgres".into(),
+                description: "default".into(),
+            },
+            QuestionOption {
+                label: "sqlite".into(),
+                description: "".into(),
+            },
+        ],
+        multi_select: multi,
+        default: None,
+    };
+    let questions = vec![q(false), q(true)];
+    let mut s = State::default();
+    s.apply(Msg::Event(StreamEvent::QuestionRequired {
+        request_id: "q1".into(),
+        questions: questions.clone(),
+        agent: None,
+    }));
+    let Some(Item::Question { picks, .. }) = s.items.last() else {
+        panic!("question item");
+    };
+    assert_eq!(picks, &[Vec::<usize>::new(), Vec::new()]);
+    // Single-select replaces; checkbox questions toggle in pick order.
+    s.pick_question(0, 0, 1);
+    s.pick_question(0, 0, 0);
+    s.pick_question(0, 1, 1);
+    s.pick_question(0, 1, 2);
+    s.pick_question(0, 1, 1);
+    s.pick_question(0, 1, 2);
+    assert_eq!(
+        crate::state::question_answers(&questions, &[vec![0], vec![1, 2]]),
+        vec![QuestionAnswer::Choice(0), QuestionAnswer::Multi(vec![1, 2]),]
+    );
+    // An untouched slot dismisses.
+    assert_eq!(
+        crate::state::question_answers(&questions, &[vec![], vec![]]),
+        vec![QuestionAnswer::Dismiss, QuestionAnswer::Dismiss]
+    );
+}
+
+#[test]
+fn question_result_and_failure_close_the_picker() {
+    let mut s = State::default();
+    let park = |s: &mut State, id: &str| {
+        s.apply(Msg::Event(StreamEvent::QuestionRequired {
+            request_id: id.into(),
+            questions: vec![dex_client::protocol::Question {
+                question: "Why?".into(),
+                header: "Why".into(),
+                options: vec![
+                    dex_client::protocol::QuestionOption {
+                        label: "a".into(),
+                        description: "".into(),
+                    },
+                    dex_client::protocol::QuestionOption {
+                        label: "b".into(),
+                        description: "".into(),
+                    },
+                ],
+                multi_select: false,
+                default: None,
+            }],
+            agent: None,
+        }));
+    };
+    park(&mut s, "q1");
+    s.apply(Msg::Event(StreamEvent::ToolResult {
+        name: "ask_user".into(),
+        summary: "Why: b (user's choice)".into(),
+        success: true,
+        preview: vec![],
+        duration: 0.0,
+        id: "1".into(),
+    }));
+    assert!(matches!(
+        s.items.iter().find(|it| matches!(it, Item::Question { .. })),
+        Some(Item::Question { decided: Some(d), .. }) if d.contains("b (user's choice)")
+    ));
+    // A failed turn closes every still-open picker.
+    park(&mut s, "q2");
+    s.apply(Msg::Event(StreamEvent::TurnFailed {
+        error: "boom".into(),
+    }));
+    let closed: Vec<_> = s
+        .items
+        .iter()
+        .filter_map(|it| match it {
+            Item::Question { decided, .. } => Some(decided.is_some()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(closed, [true, true]);
 }

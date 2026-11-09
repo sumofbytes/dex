@@ -5,6 +5,10 @@
 use rune::{Color, El, el, text};
 use rune_kit::Kit;
 
+/// The height of a window's title area: the chat pane's header and the sidebar's brand band
+/// (`view.rs` and `sidebar.rs`) are both this tall, so their hairlines sit at the same level.
+pub const TITLEBAR: f32 = 48.0;
+
 /// Type roles, as `TextStyle`s. Sizes and line heights are from DESIGN.md.
 pub mod typo {
     use rune::TextStyle;

@@ -97,7 +97,7 @@ Artboard **dex / Composer options** (Paper node 18N-0). Replaces the flat mode a
 - It sits in the same centred column as the composer (680px in Paper, 760px max in the app), so the two edges line up.
 - Height 36px with 8px bottom padding, so it doesn't touch the window edge.
 - Left: the project path in IBM Plex Mono 12px, a "·" separator, the branch icon and the branch name in mono 12px. Faint colour.
-- Right: a 6px status dot (green when ready, amber when busy) and "provider · status" in Inter 12px, faint.
+- Right: a 6px status dot (green when ready, amber when busy) and the provider name in Inter 12px, faint. No status text — thread activity shows in the sidebar's dot/spinner.
 
 ## Transcript (text first, v5)
 
