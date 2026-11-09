@@ -209,9 +209,12 @@ fn thread_row_as(
     let selected = s.page == Page::Thread && s.current.as_deref() == Some(sess.session_id.as_str());
     let is_open = s.current.as_deref() == Some(sess.session_id.as_str());
     let waiting = if is_open {
-        s.items
-            .iter()
-            .any(|i| matches!(i, Item::Approval { decided: None, .. }))
+        s.items.iter().any(|i| {
+            matches!(
+                i,
+                Item::Approval { decided: None, .. } | Item::Question { decided: None, .. }
+            )
+        })
     } else {
         s.needs
             .iter()
@@ -422,16 +425,28 @@ fn projects(s: &State) -> Vec<(String, Vec<&SessionInfo>)> {
 }
 
 pub fn sidebar(s: &State, k: &Kit) -> El {
-    let brand = text("dex")
-        .font(k.ty.body_medium)
-        .color(k.c.text_base)
-        .px(tok::PAD)
-        .key("brand");
+    // Same band the chat pane's titlebar (`view.rs` header) gives its content: 46pt of brand +
+    // the kit's 2pt header gap puts the hairline 48pt down, level with the titlebar's own rule.
+    let brand = row()
+        .key("brand")
+        .h(crate::style::TITLEBAR - space::XXS)
+        // Titlebar alignment: the hairline must land at 48pt, so the brand fills all but the
+        // kit's 2pt `header_gap`, whatever `space::XXS` amounts to.
+        .items_center()
+        .child(
+            text("dex")
+                .font(k.ty.body_medium)
+                .color(k.c.text_base)
+                .px(tok::PAD),
+        );
+    // The header's items: the brand, then a hairline under it the way the chat pane's titlebar
+    // carries one (same ink, full bleed), then the nav rows.
     let mut sb = Sidebar::new()
         .label("Navigation")
         .inset(tok::MARGIN)
-        .header_padding(12.0, 8.0)
+        .header_padding(0.0, 8.0)
         .header(brand)
+        .header(divider(k))
         .header(nav_row(
             k,
             "Home",
@@ -483,10 +498,6 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
                 .py(space::SM),
         );
     }
-
-    // A border under the header block, out to the sidebar's edges: the header column is inset
-    // by MARGIN, so the rule negative-margins back to full bleed.
-    sb = sb.header(el().w_full().h(1.0).fill(k.c.border_base).ml(-tok::MARGIN));
 
     let query = s.search.text.trim().to_lowercase();
     if s.searching && !query.is_empty() {
@@ -612,4 +623,20 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
         );
     }
     sb.build(k).key("sidebar-root")
+}
+
+/// The 1pt rule under the sidebar's brand, out to the sidebar's edges and the chat pane's
+/// titlebar divider `style::edge` ink: the header column is inset by MARGIN, so the rule
+/// negative-margins back to full bleed.
+fn divider(k: &Kit) -> El {
+    // `el()` leaves the width unset: in the flex header column a stretched item's cross size is
+    // the line's inner width minus its own margins (`line_cross - (m1 + m2)`), so the negative
+    // margins grow it back to the full sidebar width. (`style::edge`'s `w_full` would pin the
+    // width to the column's content box, `sidebar_w - 24`, which stays 24pt short of the
+    // vertical separator however far the margins bleed.)
+    el().key("sidebar-divider")
+        .h(1.0)
+        .fill(k.c.border_base)
+        .ml(-tok::MARGIN)
+        .mr(-tok::MARGIN)
 }

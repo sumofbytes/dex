@@ -268,6 +268,50 @@ fn thought_scene(s: &mut State) {
         text: "Turns out I'm not in the dex repo. I'm in a separate spike project called dex-gui.\n\n- `Cargo.toml`: a standalone workspace\n- `src/`: main.rs, state.rs\n\nWhich would you like?".into(),
         streaming: false,
     });
+    // A parked `ask_user` batch as the live picker renders it.
+    s.items.push(state::Item::Question {
+        request_id: "q-demo".into(),
+        questions: vec![
+            dex_client::protocol::Question {
+                question: "Where does the cache live?".into(),
+                header: "Cache".into(),
+                options: vec![
+                    dex_client::protocol::QuestionOption {
+                        label: "In memory".into(),
+                        description: "fastest, resets on restart".into(),
+                    },
+                    dex_client::protocol::QuestionOption {
+                        label: "On disk".into(),
+                        description: "survives restarts".into(),
+                    },
+                ],
+                multi_select: false,
+                default: Some(0),
+            },
+            dex_client::protocol::Question {
+                question: "Which workspaces should load?".into(),
+                header: "Workspaces".into(),
+                options: vec![
+                    dex_client::protocol::QuestionOption {
+                        label: "crates".into(),
+                        description: "".into(),
+                    },
+                    dex_client::protocol::QuestionOption {
+                        label: "targets".into(),
+                        description: "".into(),
+                    },
+                    dex_client::protocol::QuestionOption {
+                        label: "vendor".into(),
+                        description: "".into(),
+                    },
+                ],
+                multi_select: true,
+                default: None,
+            },
+        ],
+        picks: vec![Vec::new(), Vec::new()],
+        decided: None,
+    });
     if open {
         s.open_work.insert(1);
     }
@@ -431,6 +475,61 @@ fn detach() -> bool {
     std::process::exit(0);
 }
 
+/// A parked `ask_user` batch with a short transcript, so the picker fits the snapshot.
+fn question_scene(s: &mut State) {
+    s.page = state::Page::Thread;
+    s.status = "ready".into();
+    s.current = Some("q".into());
+    s.items.push(state::Item::User("reconsider?".into()));
+    s.items.push(Item::Assistant {
+        text: "Two options on the table.".into(),
+        streaming: false,
+    });
+    s.items.push(state::Item::Question {
+        request_id: "q-demo".into(),
+        questions: vec![
+            dex_client::protocol::Question {
+                question: "Where does the cache live?".into(),
+                header: "Cache".into(),
+                options: vec![
+                    dex_client::protocol::QuestionOption {
+                        label: "In memory".into(),
+                        description: "fastest, resets on restart".into(),
+                    },
+                    dex_client::protocol::QuestionOption {
+                        label: "On disk".into(),
+                        description: "survives restarts".into(),
+                    },
+                ],
+                multi_select: false,
+                default: Some(0),
+            },
+            dex_client::protocol::Question {
+                question: "Which workspaces should load?".into(),
+                header: "Workspaces".into(),
+                options: vec![
+                    dex_client::protocol::QuestionOption {
+                        label: "crates".into(),
+                        description: String::new(),
+                    },
+                    dex_client::protocol::QuestionOption {
+                        label: "targets".into(),
+                        description: String::new(),
+                    },
+                    dex_client::protocol::QuestionOption {
+                        label: "vendor".into(),
+                        description: String::new(),
+                    },
+                ],
+                multi_select: true,
+                default: None,
+            },
+        ],
+        picks: vec![Vec::new(), vec![2]],
+        decided: None,
+    });
+}
+
 /// Runs the GUI. `false` means it could not start and the caller should fall back (to the TUI).
 pub fn run() -> bool {
     if !detach() {
@@ -440,6 +539,7 @@ pub fn run() -> bool {
         scenes: &[
             ("chat", sample),
             ("home", home_scene),
+            ("question", question_scene),
             ("rename", rename_scene),
             ("busy", busy),
             ("needs", needs_scene),

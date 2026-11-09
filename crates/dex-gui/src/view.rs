@@ -1,6 +1,6 @@
 //! Views: sidebar, transcript, composer, footer. Pure functions of `State`.
 
-use dex_client::protocol::ApprovalDecision;
+use dex_client::protocol::{ApprovalDecision, QuestionAnswer};
 use rune::{Cursor, Cx, Drag, El, Phase, ScrollSpec, Tx, col, el, row, spacer, text, text_input};
 use rune_kit::markdown::{Markdown, MarkdownStyle};
 use rune_kit::{Button, ButtonVariant, IconButton, IconButtonVariant, Kit, Spinner};
@@ -172,7 +172,7 @@ fn header(s: &State, k: &Kit) -> El {
     }
     row()
         .w_full()
-        .h(48.0)
+        .h(crate::style::TITLEBAR)
         .px(space::XL)
         .gap(space::MD)
         .items_center()
@@ -664,6 +664,112 @@ fn item(i: usize, it: &Item, k: &Kit) -> El {
             };
             c
         }
+        Item::Question {
+            request_id,
+            questions,
+            picks,
+            decided,
+        } => {
+            let request_id = request_id.clone();
+            let mut c = col()
+                .w_full()
+                .px(14.0)
+                .py(space::XL)
+                .gap(space::MD)
+                .radius(k.radius.lg)
+                .fill(k.c.layer_02)
+                .border(1.0, k.c.border_base)
+                .child(
+                    text(format!("Question{}:", questions.len().max(1)))
+                        .font(typo::meta(k))
+                        .color(k.c.text_faint),
+                );
+            c = match decided {
+                Some(d) => c.child(text(d.clone()).font(k.ty.ui).color(k.c.text_muted)),
+                None => {
+                    // Option buttons: a single-select row press picks it; a
+                    // `multiSelect` one toggles. Pick state switches the
+                    // highlight (Contrast).
+                    for (qi, q) in questions.iter().enumerate() {
+                        c = c
+                            .child(
+                                text(q.header.clone())
+                                    .font(typo::meta(k))
+                                    .color(k.c.text_faint),
+                            )
+                            .child(
+                                text(q.question.clone())
+                                    .font(k.ty.ui_medium)
+                                    .color(k.c.text_base),
+                            );
+                        for (oi, o) in q.options.iter().enumerate() {
+                            let picked = picks.get(qi).is_some_and(|p| p.contains(&oi));
+                            let variant = if picked {
+                                ButtonVariant::Contrast
+                            } else {
+                                ButtonVariant::Neutral
+                            };
+                            let mut opt = col().gap(space::XXS).child(
+                                Button::new(o.label.clone())
+                                    .variant(variant)
+                                    .on_press(move |s: &mut State| {
+                                        s.pick_question(i, qi, oi);
+                                    })
+                                    .build(k)
+                                    .key(format!("q{qi}-o{oi}")),
+                            );
+                            if !o.description.is_empty() {
+                                opt = opt.child(
+                                    text(o.description.clone())
+                                        .font(typo::meta(k))
+                                        .color(k.c.text_faint)
+                                        .pl(12.0),
+                                );
+                            }
+                            c = c.child(opt);
+                        }
+                    }
+                    let dismiss = vec![QuestionAnswer::Dismiss; questions.len()];
+                    let send = Button::new("Send answers")
+                        .variant(ButtonVariant::Contrast)
+                        .on_press(move |s: &mut State| {
+                            let answer = s.items.get(i).and_then(|it| match it {
+                                Item::Question {
+                                    request_id,
+                                    questions,
+                                    picks,
+                                    ..
+                                } => Some((
+                                    request_id.clone(),
+                                    crate::state::question_answers(questions, picks),
+                                )),
+                                _ => None,
+                            });
+                            if let Some((request_id, answers)) = answer {
+                                s.send_cmd(Cmd::Answer {
+                                    request_id,
+                                    answers,
+                                });
+                            }
+                        })
+                        .build(k)
+                        .key("q-send");
+                    let dismiss_btn = Button::new("Dismiss")
+                        .variant(ButtonVariant::Ghost)
+                        .on_press(move |s: &mut State| {
+                            s.send_cmd(Cmd::Answer {
+                                request_id: request_id.clone(),
+                                answers: dismiss.clone(),
+                            });
+                        })
+                        .build(k)
+                        .key("q-dismiss");
+                    c = c.child(row().gap(space::MD).child(send).child(dismiss_btn));
+                    c
+                }
+            };
+            c
+        }
     }
 }
 
@@ -772,8 +878,10 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .child(stack.grow(1.0))
 }
 
-/// The line under the composer: the project path and branch on the left, the agent's status
-/// on the right. Transcript, composer text and this line share one content line (`CONTENT` inside the card).
+/// The line under the composer: the project path and branch on the left, the provider
+/// (with a readiness dot) on the right. Thread activity lives in the sidebar's dot/spinner,
+/// so no status text here. Transcript, composer text and this line share one content line
+/// (`CONTENT` inside the card).
 fn footer(s: &State, k: &Kit) -> El {
     let meta = typo::footer(k);
     let mut left = row()
@@ -805,7 +913,7 @@ fn footer(s: &State, k: &Kit) -> El {
         .items_center()
         .child(crate::style::dot(dot, 6.0))
         .child(
-            text(format!("{} · {}", s.info.provider, s.status))
+            text(s.info.provider.clone())
                 .font(typo::caption(k))
                 .color(k.c.text_faint),
         );
