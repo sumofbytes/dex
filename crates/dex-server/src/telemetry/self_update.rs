@@ -5,8 +5,10 @@
 //! catalog-refresh behavior; `--all` does both.
 //!
 //! The flow mirrors `scripts/install.sh`: resolve latest via the
-//! `/releases/latest` redirect (no API call, so no rate limits), fetch
-//! `dex-vX.Y.Z-<target>.tar.gz` + `SHA256SUMS`, verify sha256, then atomically
+//! `/releases/latest` redirect, falling back to the GitHub API when the
+//! redirect is not a tag URL (proxies/mirrors can answer 200 or rewrite it;
+//! the API fallback is a real API call, so unlike the redirect it can hit
+//! rate limits). Then fetch `dex-vX.Y.Z-<target>.tar.gz` + `SHA256SUMS`, verify sha256, then atomically
 //! rename the verified binary over the running exe (POSIX allows renaming
 //! over a running image; the old inode stays alive for in-flight processes).
 
@@ -80,15 +82,16 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
             let resp = resp.error_for_status().map_err(|e| {
                 format!("cannot check the latest release (none published yet?): {e}")
             })?;
-            let mut tag = resp
-                .url()
-                .path_segments()
-                .and_then(|mut segments| segments.next_back())
-                .unwrap_or_default()
-                .to_string();
+            let mut tag = tag_from_last_segment(resp.url().as_str()).unwrap_or_default();
             if parse_version(&tag).is_none() {
-                // Proxies/mirrors may not redirect; ask the API instead.
-                tag = latest_tag_from_api(&client, &repo).await.unwrap_or(tag);
+                // Proxies/mirrors may not redirect; ask the API instead. Its
+                // failure is only a note: the original tag still names the
+                // real problem in the error below.
+                match latest_tag_from_api(&client, &repo).await {
+                    Ok(Some(api_tag)) => tag = api_tag,
+                    Ok(None) => {}
+                    Err(api_err) => progress(&format!("GitHub API fallback failed: {api_err}")),
+                }
             }
             let version = parse_version(&tag)
                 .ok_or_else(|| format!("no valid vX.Y.Z release found for {repo} (got '{tag}')"))?;
@@ -292,23 +295,38 @@ fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
+/// Last non-empty path segment of a URL string (query/fragment stripped) —
+/// e.g. `v0.4.2` from `.../releases/tag/v0.4.2`. The redirect fallback's tag
+/// source; tolerates a trailing slash and a proxy-appended query.
+fn tag_from_last_segment(url: &str) -> Option<String> {
+    let path = url.split(['?', '#']).next()?;
+    path.rsplit('/').find(|s| !s.is_empty()).map(str::to_string)
+}
+
 /// `tag_name` of the latest release via the GitHub API (redirect fallback).
-async fn latest_tag_from_api(client: &reqwest::Client, repo: &str) -> Option<String> {
-    let body = client
+/// `Ok(None)` is a valid answer without a tag (nothing published yet); `Err`
+/// names the failure so the caller can surface it — a silent `None` would
+/// read as "the redirect was fine" when the API was rate-limited or blocked.
+async fn latest_tag_from_api(
+    client: &reqwest::Client,
+    repo: &str,
+) -> Result<Option<String>, String> {
+    let resp = client
         .get(format!(
             "https://api.github.com/repos/{repo}/releases/latest"
         ))
         .timeout(Duration::from_secs(60))
         .send()
         .await
-        .ok()?
-        .error_for_status()
-        .ok()?
-        .text()
-        .await
-        .ok()?;
-    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
-    v.get("tag_name")?.as_str().map(str::to_string)
+        .map_err(|e| e.to_string())?;
+    let resp = resp.error_for_status().map_err(|e| e.to_string())?;
+    let body = resp.text().await.map_err(|e| e.to_string())?;
+    let tag = serde_json::from_str::<serde_json::Value>(&body)
+        .map_err(|e| e.to_string())?
+        .get("tag_name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    Ok(tag)
 }
 
 /// Expected sha256 for `asset` in a `sha256sum`-format file (`<hash>  <name>`).
@@ -378,6 +396,37 @@ mod tests {
         assert_eq!(pinned_tag("v0.4.0"), "v0.4.0");
         assert_eq!(pinned_tag("V0.4.0"), "v0.4.0");
         assert_eq!(pinned_tag(" 0.4.0 "), "v0.4.0");
+    }
+
+    #[test]
+    fn tag_from_last_segment_reads_the_tag() {
+        assert_eq!(
+            tag_from_last_segment("https://github.com/a/b/releases/tag/v1.2.3").as_deref(),
+            Some("v1.2.3")
+        );
+        // Proxy-appended query/fragment and a trailing slash must not ride along.
+        assert_eq!(
+            tag_from_last_segment("https://mirror/a/b/releases/tag/v1.2.3?mirror=x").as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(
+            tag_from_last_segment("https://mirror/a/b/releases/tag/v1.2.3#x").as_deref(),
+            Some("v1.2.3")
+        );
+        assert_eq!(
+            tag_from_last_segment("https://mirror/a/b/releases/tag/v1.2.3/").as_deref(),
+            Some("v1.2.3")
+        );
+        // A 200 from a proxy leaves `latest` — the parse check then sends the
+        // caller to the API fallback.
+        assert_eq!(
+            tag_from_last_segment("https://github.com/a/b/releases/latest").as_deref(),
+            Some("latest")
+        );
+        assert_eq!(
+            tag_from_last_segment("not-a-url"),
+            Some("not-a-url".to_string())
+        );
     }
 
     #[test]

@@ -29,6 +29,12 @@ fetch() {
     curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 "$@"
 }
 
+# fetch without following redirects and without a body: reads the
+# /releases/latest Location without downloading anything.
+fetch_redirect() {
+    curl -s --connect-timeout 15 --retry 3 --retry-delay 2 -o /dev/null "$@"
+}
+
 # --- detect platform -------------------------------------------------------
 case "$(uname -s)" in
 Linux) os="linux" ;;
@@ -57,13 +63,22 @@ if [ "$VERSION" = "latest" ]; then
     # Read the Location of the /releases/latest redirect (no -L, no API call,
     # so no rate limits). Fall back to the API if the redirect is not a tag URL
     # (proxies/mirrors can answer 200 or rewrite it).
-    loc="$(curl -sS --connect-timeout 15 --retry 3 --retry-delay 2 -o /dev/null \
-        -w '%{redirect_url}' "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
+    # Read the Location of the /releases/latest redirect (no -L, no API call,
+    # so no rate limits). Fall back to the API if the redirect is not a tag URL
+    # (proxies/mirrors can answer 200 or rewrite it; the API call can hit
+    # rate limits, unlike the redirect).
+    loc="$(fetch_redirect -w '%{redirect_url}' \
+        "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
     case "$loc" in
-    */releases/tag/*) VERSION="${loc##*/tag/}" ;;
+    */releases/tag/*)
+        VERSION="${loc##*/tag/}"
+        # A rewriting proxy can append a query or fragment after the tag.
+        VERSION="${VERSION%%\?*}"
+        VERSION="${VERSION%%\#*}"
+        ;;
     *)
         VERSION="$(fetch "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
-            sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)" || true
+            grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | cut -d'"' -f4)" || true
         [ -n "$VERSION" ] || err "cannot determine latest release (none published yet?); pass a version, e.g. sh -s -- 0.30.0"
         ;;
     esac

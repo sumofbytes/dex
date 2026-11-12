@@ -207,15 +207,18 @@ pub fn home(s: &State, k: &Kit, inset: f32, layer: &mut Vec<El>) -> El {
     col()
         .w_full()
         .h_full()
-        .child(
-            row()
-                .w_full()
-                .h(48.0)
-                .px(space::XL)
-                .pl(crate::sidebar::lights_pad(inset, space::XL))
-                .items_center()
-                .children((!s.sidebar).then(|| crate::sidebar::toggle(k))),
-        )
+        .child({
+            // The toggle only appears here while the sidebar is closed; its padding then
+            // clears the traffic lights, matching the chat pane's titlebar (`view.rs`).
+            // Open, the row is empty and keeps the plain page padding.
+            let head = row().w_full().h(48.0).px(space::XL).items_center();
+            if s.sidebar {
+                head
+            } else {
+                head.pl(crate::sidebar::lights_pad(inset, space::XL))
+                    .child(crate::sidebar::toggle(k))
+            }
+        })
         .child(
             col()
                 .w_full()

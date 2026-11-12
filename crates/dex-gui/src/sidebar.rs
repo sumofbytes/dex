@@ -477,7 +477,10 @@ pub fn sidebar(s: &State, k: &Kit, inset: f32) -> El {
         .key("brand")
         .h(crate::style::TITLEBAR - space::XXS)
         // Titlebar alignment: the hairline must land at 48pt, so the brand fills all but the
-        // kit's 2pt `header_gap`, whatever `space::XXS` amounts to.
+        // kit's 2pt `header_gap`, whatever `space::XXS` amounts to. The 2pt top pad centers the
+        // row's children on the same 24pt centerline as the chat pane's 48pt header rows, so
+        // the toggle stays put when the sidebar opens or closes.
+        .pt(space::XXS)
         .items_center()
         .gap(space::MD)
         .pl(lights_pad(inset, tok::PAD))
