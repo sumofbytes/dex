@@ -82,6 +82,7 @@ One grid (`src/sidebar.rs::tok`, board "dex / Sidebar v3 · grid"). Width 280, m
 - Brand "dex" at x 22, 14px weight 600. Nav labels 12px weight 500; selected row fill #433b3b, radius 8. Thread titles 12px, selected weight 500. Project names 10px caps. Times and hint mono 12.
 - The whole project header toggles collapse (no chevron); × (hide) shows on hover only. The 16px lead holds a static folder icon in the project colour — it never shows a spinner; a running thread's spinner lives on its own row. Titles truncate with an ellipsis.
 - A double-click on a thread row edits its title in place: the title becomes a single-line field with the text selected, Return sends the rename to the daemon (`POST /api/sessions/{id}/name`), Escape or a press elsewhere keeps the old title.
+- The PROJECTS label row ends with a `+` (same slot grid as the project headers' `+`) that opens the platform's folder picker; the picked folder becomes the next thread's project and lists in the sidebar right away (not in Paper yet).
 
 ## Composer options
 
@@ -89,7 +90,7 @@ Artboard **dex / Composer options** (Paper node 18N-0). Replaces the flat mode a
 
 - Mode menu: a titled list (MODE) of Read-only, Ask and Trusted, each with a one-line description. The current mode has a fill and a check mark. Menu width 240px.
 - Model menu: 280px. A search field, then models grouped by provider (OPENCODE). Each row shows the model name in mono, the provider in faint text, and a check on the current model. A "12 more · type to filter" row appears when the list is long.
-- Chips in the composer: mode with a sliders icon, model with the provider in faint text. Both open their menus upward from the composer.
+- Chips in the composer: project with a folder icon (opens the platform's folder picker, no chevron — it isn't a menu), mode with a sliders icon, model with the provider in faint text. Mode and model open their menus upward from the composer.
 - Menus share a surface (#2c2626), 1px border (#4a4141), radius 12, 6px padding; rows radius 8.
 
 ## Footer under the composer

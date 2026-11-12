@@ -11,8 +11,8 @@ use crate::style::{space, typo};
 
 const COLUMN: f32 = 760.0;
 /// Left indent of what opens under a quiet row: tool names and a thought's chevron sit here,
-/// on the work head's text column (head padding 8 + chevron 12 + gap 6).
-const NESTED: f32 = 26.0;
+/// on the work head's text column (chevron 12 + gap 6), aligned with the reply text above.
+const NESTED: f32 = 18.0;
 /// The content line: text, bubbles and the footer sit this far inside the composer card's edge,
 /// where the input's own text starts, so everything shares a left and a right edge.
 const CONTENT: f32 = 12.0;
@@ -21,7 +21,7 @@ pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
     let k = crate::theme::kit();
     let mut layer = Vec::new();
     let page = match s.page {
-        Page::Home => crate::home::home(s, k),
+        Page::Home => crate::home::home(s, k, &mut layer),
         Page::Thread => main_pane(s, k, &mut layer),
     };
     let mut body = row().w_full().h_full().fill(k.c.page);
@@ -222,7 +222,11 @@ fn transcript(s: &State, k: &Kit) -> El {
         .max_w(COLUMN)
         .gap(space::XXL)
         .py(space::XXL)
-        .px(CONTENT);
+        .px(CONTENT)
+        // One selection across the transcript, as the paragraphs of a web page: a drag from one
+        // item into another selects across them, Ctrl+A selects the lot, Ctrl+C copies the text
+        // as drawn.
+        .selection_group(true);
     if s.items.is_empty() {
         list = list.child(
             col()
@@ -235,7 +239,13 @@ fn transcript(s: &State, k: &Kit) -> El {
                         .font(k.ty.body_medium)
                         .color(k.c.text_base),
                 )
-                .child(text(s.cwd()).font(k.ty.ui).color(k.c.text_muted)),
+                .child(
+                    text(s.cwd())
+                        .font(k.ty.ui)
+                        .color(k.c.text_muted)
+                        .selectable(true)
+                        .selection_color(k.selection()),
+                ),
         );
     }
     let mut i = 0;
@@ -246,7 +256,13 @@ fn transcript(s: &State, k: &Kit) -> El {
             while i < s.items.len() && crate::state::is_work(&s.items[i]) {
                 i += 1;
             }
-            list = list.child(work_block(s, k, start, i));
+            let mut block = work_block(s, k, start, i);
+            // Worked is a consequence of the text right above it, so it hugs that text: 6 under
+            // the 16-point block rhythm, instead of a full block apart.
+            if start > 0 {
+                block = block.mt(-space::LG);
+            }
+            list = list.child(block);
             continue;
         }
         let mut el = item(i, &s.items[i], k).key(format!("item{i}"));
@@ -305,13 +321,14 @@ fn stop_button(k: &Kit) -> El {
     .key("stop")
 }
 
-/// The live row while a turn runs: spinner on the block head's mark column (head padding 8),
-/// label on its text column, and the ghost Stop button at the right end. Gone once the turn ends.
+/// The live row while a turn runs: spinner on the block head's mark column (flush with the
+/// text edge), label on its text column, and the ghost Stop button at the right end. Gone once
+/// the turn ends.
 fn live_row(k: &Kit, label: &str) -> El {
     row()
         .w_full()
         .h(24.0)
-        .px(space::MD)
+        .pr(space::MD)
         .gap(space::SM)
         .items_center()
         .child(Spinner::new().size(12.0).build(k))
@@ -382,12 +399,12 @@ fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
             .key(format!("work{start}"))
             .w_full()
             .h(24.0)
-            .px(space::MD)
+            .pr(space::MD)
             .gap(space::SM)
             .items_center()
             .radius(k.radius.md)
             // The spinner takes the chevron's place while live, so its label sits on the same
-            // text column as the done row's (padding + spinner 12 + gap 6 = padding + chevron 12 + gap 6).
+            // text column as the done row's (spinner 12 + gap 6 = chevron 12 + gap 6).
             .child(Spinner::new().size(12.0).build(k))
             .child(text(label).font(k.ty.ui_medium).color(k.c.text_muted))
             .child(spacer().grow(1.0))
@@ -402,7 +419,7 @@ fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
             .key(format!("work{start}"))
             .w_full()
             .h(24.0)
-            .px(space::MD)
+            .pr(space::MD)
             .gap(space::SM)
             .items_center()
             .radius(k.radius.md)
@@ -474,7 +491,9 @@ fn thought(i: usize, k: &Kit, text_: &str, open: bool, secs: Option<u64>) -> El 
                 .font(typo::meta(k))
                 .color(k.c.text_faint)
                 .wrap()
-                .pl(18.0),
+                .pl(18.0)
+                .selectable(true)
+                .selection_color(k.selection()),
         );
     }
     group
@@ -493,11 +512,14 @@ fn item(i: usize, it: &Item, k: &Kit) -> El {
                     text(t.clone())
                         .font(typo::reply(k))
                         .color(k.c.text_base)
-                        .wrap(),
+                        .wrap()
+                        .selectable(true)
+                        .selection_color(k.selection()),
                 ),
         ),
         Item::Assistant { text: t, streaming } => Markdown::new(t.clone())
             .style(reply_style(k))
+            .selectable(true)
             .streaming(*streaming)
             .build(k)
             .w_full(),
@@ -579,7 +601,9 @@ fn item(i: usize, it: &Item, k: &Kit) -> El {
                                     .color(ink)
                                     .truncate()
                                     .grow(1.0)
-                                    .min_w(0.0),
+                                    .min_w(0.0)
+                                    .selectable(true)
+                                    .selection_color(k.selection()),
                             ),
                     );
                 }
@@ -590,14 +614,22 @@ fn item(i: usize, it: &Item, k: &Kit) -> El {
             .font(typo::meta(k))
             .color(k.c.text_faint)
             .w_full()
-            .wrap(),
+            .wrap()
+            .selectable(true)
+            .selection_color(k.selection()),
         Item::Error(t) => col()
             .w_full()
             .px(space::XL)
             .py(space::MD)
             .radius(k.radius.md)
             .fill(k.c.danger.bg)
-            .child(text(t.clone()).font(k.ty.ui).color(k.c.danger.fg)),
+            .child(
+                text(t.clone())
+                    .font(k.ty.ui)
+                    .color(k.c.danger.fg)
+                    .selectable(true)
+                    .selection_color(k.selection()),
+            ),
         Item::Approval {
             request_id,
             name,

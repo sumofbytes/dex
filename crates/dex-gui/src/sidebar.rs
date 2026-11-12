@@ -5,7 +5,7 @@
 //! their positions cannot drift. All sizes come from `tok`.
 
 use dex_client::protocol::SessionInfo;
-use rune::{El, Key, el, row, spacer, text, text_input};
+use rune::{El, Key, Tx, el, row, spacer, text, text_input};
 use rune_kit::shell::Sidebar;
 use rune_kit::{ControlSize, IconButton, IconButtonVariant, Kit, Spinner};
 use rune_theme_opencode::icons as kit_icons;
@@ -392,6 +392,28 @@ fn project_header(k: &Kit, p: ProjectHeader) -> El {
         .build()
 }
 
+/// The PROJECTS label row: the section label, and at its trailing edge a `+` that opens the
+/// platform's folder picker (see `state::pick_project`) to add a project.
+fn projects_label(k: &Kit) -> El {
+    row()
+        .key("projects-label")
+        .w_full()
+        .px(tok::PAD)
+        .pt(14.0)
+        .pb(space::XS)
+        .items_center()
+        .child(caps(k, "PROJECTS").grow(1.0))
+        .child(
+            IconButton::new(&kit_icons::PLUS)
+                .control_size(ControlSize::Small)
+                .variant(IconButtonVariant::GhostMuted)
+                .label("Add project")
+                .on_press_tx(|s: &mut State, tx: &mut Tx| s.pick_project(tx))
+                .build(k)
+                .key("projects-add"),
+        )
+}
+
 /// A quiet row under a list ("Show 2 more"), its text in the text column.
 fn more_link(k: &Kit, key: String, label: String, f: impl Fn(&mut State) + 'static) -> El {
     shell(k, key, false)
@@ -401,7 +423,9 @@ fn more_link(k: &Kit, key: String, label: String, f: impl Fn(&mut State) + 'stat
         .build()
 }
 
-fn projects(s: &State) -> Vec<(String, Vec<&SessionInfo>)> {
+/// The sidebar's project list: each project root with its threads, the open thread's
+/// project first (even when it has no threads yet).
+pub(crate) fn projects(s: &State) -> Vec<(String, Vec<&SessionInfo>)> {
     let current = crate::worktree::project_root(&s.cwd());
     let mut out: Vec<(String, Vec<&SessionInfo>)> = Vec::new();
     for sess in s
@@ -548,15 +572,7 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
         }
     }
 
-    sb = sb.child(
-        row()
-            .key("projects-label")
-            .w_full()
-            .px(tok::PAD)
-            .pt(14.0)
-            .pb(space::XS)
-            .child(caps(k, "PROJECTS")),
-    );
+    sb = sb.child(projects_label(k));
 
     let projects = projects(s);
     let hidden = projects.len().saturating_sub(tok::PROJECTS);

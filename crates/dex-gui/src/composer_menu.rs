@@ -3,11 +3,11 @@
 //! provider. Both open upward from their chip.
 
 use crate::style::{caps, space, typo};
-use rune::{El, ScrollSpec, col, el, row, text, text_input};
+use rune::{El, ScrollSpec, Tx, col, el, row, text, text_input};
 use rune_kit::{Kit, Placement, Popover};
 
 use crate::icons;
-use crate::state::State;
+use crate::state::{State, project_name};
 
 /// The permission modes in display order: (value sent to the daemon, name, description).
 pub const MODES: [(&str, &str, &str); 3] = [
@@ -19,31 +19,68 @@ pub const MODES: [(&str, &str, &str); 3] = [
 /// Models shown before the list asks the user to filter.
 const MAX_MODELS: usize = 12;
 
-/// A chip in the composer: an optional icon, a label, faint detail, and a chevron.
-fn chip(k: &Kit, icon: Option<&'static rune::Icon>, label: &str, detail: &str, key: &str) -> El {
+/// A chip in the composer: an optional icon, a label, faint detail, and — unless it opens
+/// something other than an upward menu (the project chip opens the folder picker) — a chevron.
+fn chip(
+    k: &Kit,
+    icon: Option<&'static rune::Icon>,
+    label: &str,
+    detail: &str,
+    key: &str,
+    chevron: bool,
+) -> El {
     let mut r = row()
         .key(key.to_string())
         .h(28.0)
         .px(space::MD)
         .gap(space::SM)
         .items_center()
-        .radius(k.radius.md);
+        .radius(k.radius.md)
+        .shrink()
+        .min_w(0.0);
     if let Some(ic) = icon {
         r = r.child(rune::icon(ic, 12.0).color(k.c.text_muted));
     }
     r = r.child(
         text(label.to_string())
             .font(k.ty.ui_medium)
-            .color(k.c.text_muted),
+            .color(k.c.text_muted)
+            .truncate()
+            .shrink()
+            .min_w(0.0),
     );
     if !detail.is_empty() {
         r = r.child(
             text(detail.to_string())
                 .font(typo::caption(k))
-                .color(k.c.text_faint),
+                .color(k.c.text_faint)
+                .truncate()
+                .shrink()
+                .min_w(0.0),
         );
     }
-    r.child(rune::icon(&icons::DOWN, 12.0).color(k.c.text_faint))
+    if chevron {
+        r = r.child(rune::icon(&icons::DOWN, 12.0).color(k.c.text_faint));
+    }
+    r
+}
+
+/// The project chip: the directory the next thread runs in. Pressing opens the platform's
+/// folder picker (`state::pick_project`) to change it — no menu, so no chevron.
+pub fn project(s: &State, k: &Kit) -> El {
+    k.interactive(chip(
+        k,
+        Some(&crate::icons::FOLDER),
+        &project_name(&s.cwd()),
+        "",
+        "project-chip",
+        false,
+    ))
+    .help(format!(
+        "New threads run in {}; press to change it",
+        s.cwd()
+    ))
+    .on_press_tx(|s: &mut State, tx: &mut Tx| s.pick_project(tx))
 }
 
 /// One row of a menu: a name with an optional description, and a check on the current one.
@@ -101,7 +138,7 @@ pub fn mode(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .unwrap_or("Trusted");
     let open = s.open_select == Some("mode");
     let trigger = k
-        .interactive(chip(k, Some(&icons::SLIDERS), name, "", "mode-chip"))
+        .interactive(chip(k, Some(&icons::SLIDERS), name, "", "mode-chip", true))
         .on_press(|s: &mut State| {
             s.open_select = if s.open_select == Some("mode") {
                 None
@@ -148,7 +185,7 @@ pub fn model(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let provider = s.info.provider.clone();
     let open = s.open_select == Some("model");
     let trigger = k
-        .interactive(chip(k, None, &current, &provider, "model-chip"))
+        .interactive(chip(k, None, &current, &provider, "model-chip", true))
         .on_press(|s: &mut State| {
             s.open_select = if s.open_select == Some("model") {
                 None
