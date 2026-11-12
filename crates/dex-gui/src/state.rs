@@ -1216,6 +1216,11 @@ impl State {
         self.page = Page::Thread;
         self.issue.replace_text("");
         self.show_more = false;
+        // The issue field always starts a thread. The Home nav does not clear the last
+        // opened one, so drop it first or Send would continue that thread's session.
+        if !self.fresh_thread() {
+            self.send_cmd(Cmd::NewSession);
+        }
         self.items.push(Item::User(text.clone()));
         self.sending = true;
         self.status = "working…".into();
@@ -1224,8 +1229,13 @@ impl State {
             text,
             model: self.model.clone(),
             permission: self.permission.clone(),
-            worktree: self.use_worktree && self.current.is_none(),
+            worktree: self.use_worktree, // a fresh session is guaranteed above
         });
+    }
+
+    /// No session is attached: `None` (fresh start) or `""` (after NewSession).
+    fn fresh_thread(&self) -> bool {
+        self.current.as_deref().is_none_or(|id| id.is_empty())
     }
 
     pub fn submit(&mut self) {
@@ -1253,7 +1263,9 @@ impl State {
             text,
             model: self.model.clone(),
             permission: self.permission.clone(),
-            worktree: self.use_worktree && self.current.is_none(),
+            // Worktrees only apply to a thread that does not exist yet: an empty id
+            // marks a fresh thread (NewSession), `None` a fresh start.
+            worktree: self.use_worktree && self.fresh_thread(),
         });
     }
 }
@@ -1421,6 +1433,48 @@ mod tests {
             },
         });
         assert!(!s.busy() && !s.running.contains("n"));
+    }
+
+    #[test]
+    fn submit_issue_starts_a_thread_even_when_one_is_still_open() {
+        let mut s = State::default();
+        // Open a thread, then go back to Home: the nav keeps the thread open.
+        s.apply(Msg::Opened {
+            id: "old".into(),
+            replay: Vec::new(),
+        });
+        s.page = Page::Home;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        s.cmds = Some(tx);
+        s.issue.replace_text("fix the bug");
+        s.submit_issue();
+        // The stale thread is dropped first, so Send creates a fresh session.
+        assert!(matches!(rx.try_recv(), Ok(Cmd::NewSession)));
+        match rx.try_recv() {
+            Ok(Cmd::Send { text, worktree, .. }) => {
+                assert_eq!(text, "fix the bug");
+                assert!(!worktree);
+            }
+            _ => panic!("expected Send"),
+        }
+    }
+
+    #[test]
+    fn a_fresh_issue_uses_the_worktree_toggle() {
+        let mut s = State::default();
+        s.apply(Msg::Opened {
+            id: String::new(),
+            replay: Vec::new(),
+        });
+        s.use_worktree = true;
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        s.cmds = Some(tx);
+        s.issue.replace_text("fix the bug");
+        s.submit_issue();
+        match rx.try_recv() {
+            Ok(Cmd::Send { worktree, .. }) => assert!(worktree),
+            _ => panic!("expected Send"),
+        }
     }
 
     #[test]
