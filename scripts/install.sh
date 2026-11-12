@@ -29,6 +29,12 @@ fetch() {
     curl -fsSL --connect-timeout 15 --retry 3 --retry-delay 2 "$@"
 }
 
+# fetch without following redirects and without a body: reads the
+# /releases/latest Location without downloading anything.
+fetch_redirect() {
+    curl -s --connect-timeout 15 --retry 3 --retry-delay 2 -o /dev/null "$@"
+}
+
 # --- detect platform -------------------------------------------------------
 case "$(uname -s)" in
 Linux) os="linux" ;;
@@ -54,19 +60,28 @@ esac
 
 # --- resolve version -------------------------------------------------------
 if [ "$VERSION" = "latest" ]; then
-    # Follow the /releases/latest redirect; no API call, so no rate limits.
-    # Use a temp file instead of a pipeline: POSIX sh reports a pipeline's
-    # status from its last command, so curl's exit status would be swallowed —
-    # and `-w '%{url_effective}'` echoes the *original* URL on failure, which
-    # used to leak into the asset name.
-    tag_file="$(mktemp)"
-    if ! fetch -o /dev/null -w '%{url_effective}' \
-            "https://github.com/$REPO/releases/latest" >"$tag_file"; then
-        rm -f "$tag_file"
-        err "cannot determine latest release (none published yet?)"
-    fi
-    VERSION="$(sed 's|.*/tag/||' "$tag_file")"
-    rm -f "$tag_file"
+    # Read the Location of the /releases/latest redirect (no -L, no API call,
+    # so no rate limits). Fall back to the API if the redirect is not a tag URL
+    # (proxies/mirrors can answer 200 or rewrite it).
+    # Read the Location of the /releases/latest redirect (no -L, no API call,
+    # so no rate limits). Fall back to the API if the redirect is not a tag URL
+    # (proxies/mirrors can answer 200 or rewrite it; the API call can hit
+    # rate limits, unlike the redirect).
+    loc="$(fetch_redirect -w '%{redirect_url}' \
+        "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
+    case "$loc" in
+    */releases/tag/*)
+        VERSION="${loc##*/tag/}"
+        # A rewriting proxy can append a query or fragment after the tag.
+        VERSION="${VERSION%%\?*}"
+        VERSION="${VERSION%%\#*}"
+        ;;
+    *)
+        VERSION="$(fetch "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null |
+            grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | cut -d'"' -f4)" || true
+        [ -n "$VERSION" ] || err "cannot determine latest release (none published yet?); pass a version, e.g. sh -s -- 0.30.0"
+        ;;
+    esac
 fi
 case "$VERSION" in
 v[0-9]*) ;;

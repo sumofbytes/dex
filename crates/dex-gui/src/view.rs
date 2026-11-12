@@ -17,17 +17,17 @@ const NESTED: f32 = 18.0;
 /// where the input's own text starts, so everything shares a left and a right edge.
 const CONTENT: f32 = 12.0;
 
-pub fn view(s: &State, _cx: &mut Cx<State>) -> El {
+pub fn view(s: &State, cx: &mut Cx<State>) -> El {
     let k = crate::theme::kit();
     let mut layer = Vec::new();
     let page = match s.page {
-        Page::Home => crate::home::home(s, k, &mut layer),
-        Page::Thread => main_pane(s, k, &mut layer),
+        Page::Home => crate::home::home(s, k, cx.titlebar_inset(), &mut layer),
+        Page::Thread => main_pane(s, k, cx.titlebar_inset(), &mut layer),
     };
     let mut body = row().w_full().h_full().fill(k.c.page);
     if s.sidebar {
         body = body
-            .child(crate::sidebar::sidebar(s, k).w(s.sidebar_w))
+            .child(crate::sidebar::sidebar(s, k, cx.titlebar_inset()).w(s.sidebar_w))
             .child(el().w(1.0).h_full().fill(k.c.border_base))
             .child(page.grow(1.0).min_w(0.0))
             .child(sidebar_edge(s));
@@ -98,12 +98,12 @@ fn viewer_edge(s: &State) -> El {
         })
 }
 
-fn main_pane(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+fn main_pane(s: &State, k: &Kit, inset: f32, layer: &mut Vec<El>) -> El {
     let card = col()
         .key("main")
         .h_full()
         .fill(k.c.page)
-        .child(header(s, k))
+        .child(header(s, k, inset))
         .child(crate::style::edge(k))
         .child(transcript(s, k))
         .child(composer(s, k, layer))
@@ -111,13 +111,7 @@ fn main_pane(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     card.grow(1.0).min_h(0.0)
 }
 
-fn header(s: &State, k: &Kit) -> El {
-    let toggle = IconButton::new(&crate::icons::PANEL)
-        .variant(IconButtonVariant::Ghost)
-        .label("Toggle sidebar")
-        .on_press(|s: &mut State| s.sidebar = !s.sidebar)
-        .build(k)
-        .key("toggle-sidebar");
+fn header(s: &State, k: &Kit, inset: f32) -> El {
     let title = text(s.title())
         .font(k.ty.ui_medium)
         .color(k.c.text_base)
@@ -170,14 +164,21 @@ fn header(s: &State, k: &Kit) -> El {
                 .color(k.c.text_muted),
         );
     }
-    row()
+    // The sidebar's toggle is in the sidebar while it is open; closed, this header starts with it,
+    // past the traffic lights.
+    let mut bar = row()
         .w_full()
         .h(crate::style::TITLEBAR)
-        .px(space::XL)
+        .pr(space::XL)
         .gap(space::MD)
-        .items_center()
-        .child(toggle)
-        .child(title.grow(1.0).min_w(0.0))
+        .items_center();
+    bar = if s.sidebar {
+        bar.pl(space::XL)
+    } else {
+        bar.pl(crate::sidebar::lights_pad(inset, space::XL))
+            .child(crate::sidebar::toggle(k))
+    };
+    bar.child(title.grow(1.0).min_w(0.0))
         .child(stats)
         .child(
             IconButton::new(&crate::icons::SLIDERS)

@@ -74,7 +74,7 @@ fn issue_card(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         )
 }
 
-pub fn home(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+pub fn home(s: &State, k: &Kit, inset: f32, layer: &mut Vec<El>) -> El {
     let now = Local::now();
     let greeting = match now.hour() {
         5..=11 => "Good morning",
@@ -96,13 +96,6 @@ pub fn home(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .collect();
     projects.sort_unstable();
     projects.dedup();
-
-    let toggle = rune_kit::IconButton::new(&crate::icons::PANEL)
-        .variant(rune_kit::IconButtonVariant::Ghost)
-        .label("Toggle sidebar")
-        .on_press(|s: &mut State| s.sidebar = !s.sidebar)
-        .build(k)
-        .key("home-toggle");
 
     let subtitle = match dated.len() {
         0 => "Nothing moved in the last two days. Write a new issue.".to_string(),
@@ -214,14 +207,18 @@ pub fn home(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     col()
         .w_full()
         .h_full()
-        .child(
-            row()
-                .w_full()
-                .h(48.0)
-                .px(space::XL)
-                .items_center()
-                .child(toggle),
-        )
+        .child({
+            // The toggle only appears here while the sidebar is closed; its padding then
+            // clears the traffic lights, matching the chat pane's titlebar (`view.rs`).
+            // Open, the row is empty and keeps the plain page padding.
+            let head = row().w_full().h(48.0).px(space::XL).items_center();
+            if s.sidebar {
+                head
+            } else {
+                head.pl(crate::sidebar::lights_pad(inset, space::XL))
+                    .child(crate::sidebar::toggle(k))
+            }
+        })
         .child(
             col()
                 .w_full()
