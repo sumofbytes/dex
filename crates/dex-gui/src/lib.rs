@@ -410,14 +410,39 @@ fn log_path() -> Option<std::path::PathBuf> {
     Some(dir.join("gui.log"))
 }
 
-/// How long the launcher watches the relaunched GUI for an early crash (no GPU/Vulkan driver,
-/// no window system) before handing the shell back.
+/// Upper bound the launcher waits for the relaunched GUI's ready signal (or an early crash:
+/// no GPU/Vulkan driver, no window system) before handing the shell back.
 const START_GRACE: std::time::Duration = std::time::Duration::from_millis(2500);
 
-/// Like `code .`: relaunch ourselves in the background and return to the shell. Skipped with
-/// any argument (`-f`, `--snap`, … stay in the foreground), with `DEX_GUI_FOREGROUND`, and in
-/// the relaunched child itself. Returns `false` when the child died within [`START_GRACE`] of a
-/// failed start, so the caller can fall back instead of leaving the user with nothing.
+/// Fresh dir for the child's `RUNE_READY_DIR` readiness file (Rune writes one file per process
+/// once its first window's `on_ready` has run). `None` when a temp dir cannot be made; the
+/// caller then falls back to waiting out [`START_GRACE`].
+fn ready_dir() -> Option<std::path::PathBuf> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("dex-gui-ready-{}-{nanos}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
+/// True once the child wrote its readiness file (written atomically via a dotfile rename, so
+/// only non-hidden entries count).
+fn ready_signaled(dir: &std::path::Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .flatten()
+            .any(|e| !e.file_name().to_string_lossy().starts_with('.'))
+    })
+}
+
+/// Like `code .`: relaunch ourselves in the background and return to the shell as soon as the
+/// child's first window is ready (via `RUNE_READY_DIR`), or after [`START_GRACE`] at the latest.
+/// Skipped with any argument (`-f`, `--snap`, … stay in the foreground), with
+/// `DEX_GUI_FOREGROUND`, and in the relaunched child itself. Returns `false` when the child died
+/// within [`START_GRACE`] of a failed start, so the caller can fall back instead of leaving the
+/// user with nothing.
 fn detach() -> bool {
     use std::process::{Command, Stdio};
     if std::env::args().len() > 1
@@ -445,6 +470,11 @@ fn detach() -> bool {
         .stdin(Stdio::null())
         .stdout(out)
         .stderr(err);
+    // shortcut: a fresh dir per launch, removed below; a killed launcher leaks it for tmp cleanup.
+    let ready = ready_dir();
+    if let Some(dir) = &ready {
+        cmd.env("RUNE_READY_DIR", dir);
+    }
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -456,22 +486,41 @@ fn detach() -> bool {
         cmd.creation_flags(0x0000_0008 | 0x0000_0200); // DETACHED_PROCESS | NEW_PROCESS_GROUP
     }
     let Ok(mut child) = cmd.spawn() else {
+        if let Some(dir) = &ready {
+            let _ = std::fs::remove_dir_all(dir);
+        }
         return true; // could not relaunch: run in this process instead
     };
+    let done = |ready: &Option<std::path::PathBuf>| {
+        if let Some(dir) = ready {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    };
     let deadline = std::time::Instant::now() + START_GRACE;
-    while std::time::Instant::now() < deadline {
+    loop {
         match child.try_wait() {
             Ok(Some(status)) if !status.success() => {
                 eprintln!(
                     "dex: the GUI failed to start ({status}); details in {}",
                     log_path().map_or_else(|| "its log".into(), |p| p.display().to_string())
                 );
+                done(&ready);
                 return false;
             }
             Ok(Some(_)) | Err(_) => break,
-            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            Ok(None) => {
+                // The window is up: hand the shell back without waiting out the grace period.
+                if ready.as_deref().is_some_and(ready_signaled) {
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
         }
     }
+    done(&ready);
     std::process::exit(0);
 }
 
@@ -563,4 +612,192 @@ pub fn run() -> bool {
         ..AppSpec::new("dex", (1100.0, 760.0), State::default, view::view)
     });
     true
+}
+
+#[cfg(test)]
+mod launcher_tests {
+    use super::*;
+
+    #[test]
+    fn ready_signaled_ignores_the_in_flight_tmp_file() {
+        let dir = std::env::temp_dir().join(format!("dex-gui-ready-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(!ready_signaled(&dir), "empty dir");
+        std::fs::write(dir.join(".dex.123.tmp"), b"{\n").unwrap();
+        assert!(!ready_signaled(&dir), "hidden temp file is not ready");
+        std::fs::write(dir.join("dex.123"), b"{}\n").unwrap();
+        assert!(ready_signaled(&dir), "the renamed signal counts");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+/// The sidebar's `+` on PROJECTS asks for a folder dialog; the answer (scripted here, as the
+/// host would inject it) starts a fresh thread in the picked folder.
+#[cfg(test)]
+mod add_project_tests {
+    use super::*;
+    use rune::{Env, Runtime};
+
+    fn rt() -> Runtime<State> {
+        let mut rt = Runtime::new(
+            State::default(),
+            view::view,
+            (1200.0, 900.0),
+            Env::new(true, 2.0),
+        );
+        rt.frame(0.0);
+        rt
+    }
+
+    fn add_button(rt: &Runtime<State>) -> (f32, f32) {
+        let e = rt
+            .elements()
+            .into_iter()
+            .find(|e| e.label.as_deref() == Some("Add project"))
+            .unwrap_or_else(|| panic!("no Add project button"));
+        (e.rect[0] + e.rect[2] / 2.0, e.rect[1] + e.rect[3] / 2.0)
+    }
+
+    #[test]
+    fn the_projects_plus_asks_for_a_folder_and_the_answer_adds_the_project() {
+        let mut rt = rt();
+        let (x, y) = add_button(&rt);
+        rt.pointer_move(x, y);
+        rt.frame(1.0 / 60.0);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        let (kind, _) = rt.file_dialog().expect("the press asked for a dialog");
+        assert_eq!(kind, rune::FileDialogKind::Folder);
+        rt.resolve_file_dialog(Some("/home/x/repo".into())).unwrap();
+        rt.frame(2.0 / 60.0);
+        assert_eq!(rt.state.project.as_deref(), Some("/home/x/repo"));
+        assert_eq!(rt.state.page, state::Page::Thread);
+        // A cancelled picker changes nothing.
+        let (x, y) = add_button(&rt);
+        rt.pointer_move(x, y);
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+        rt.resolve_file_dialog(None).unwrap();
+        rt.frame(2.0 / 60.0);
+        assert_eq!(rt.state.project.as_deref(), Some("/home/x/repo"));
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use rune::{Cursor, Env, Runtime};
+
+    /// The real view with a user message and a finished reply mounted.
+    fn rt() -> Runtime<State> {
+        let s = State {
+            page: state::Page::Thread,
+            current: Some("s0".into()),
+            status: "ready".into(),
+            items: vec![
+                Item::User("List the crates in this repo".into()),
+                Item::Assistant {
+                    text: "There are nine crates here.".into(),
+                    streaming: false,
+                },
+            ],
+            ..State::default()
+        };
+        let mut rt = Runtime::new(s, view::view, (1200.0, 900.0), Env::new(true, 2.0));
+        rt.frame(0.0);
+        rt
+    }
+
+    fn element(rt: &Runtime<State>, needle: &str) -> rune::runtime::ElementInfo {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.text.as_deref().is_some_and(|t| t.contains(needle)))
+            .unwrap_or_else(|| panic!("no element with text {needle:?}"))
+    }
+
+    fn centre(r: &[f32; 4]) -> (f32, f32) {
+        (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)
+    }
+
+    fn tick(rt: &mut Runtime<State>) {
+        rt.frame(1.0 / 60.0);
+    }
+
+    /// Drag from `from` to `to`, as a slow pointer drag selects.
+    fn drag(rt: &mut Runtime<State>, from: (f32, f32), to: (f32, f32)) {
+        rt.pointer_move(from.0, from.1);
+        tick(rt);
+        rt.pointer_down(from.0, from.1);
+        tick(rt);
+        for k in 1..=6 {
+            let f = k as f32 / 6.0;
+            rt.pointer_move(from.0 + (to.0 - from.0) * f, from.1 + (to.1 - from.1) * f);
+            tick(rt);
+        }
+        rt.pointer_up(to.0, to.1);
+        tick(rt);
+    }
+
+    #[test]
+    fn a_drag_selects_transcript_text_and_ctrl_c_copies() {
+        let mut rt = rt();
+        let user = element(&rt, "List the crates in this repo");
+        let reply = element(&rt, "There are nine crates here.");
+        // An I-beam over transcript text: it is selectable.
+        rt.pointer_move(centre(&user.rect).0, centre(&user.rect).1);
+        tick(&mut rt);
+        assert_eq!(rt.cursor(), Cursor::Text, "transcript text is selectable");
+        // Drag through the user message: its text, selected and copied on release.
+        let at = |r: &[f32; 4]| (r[0] + 4.0, r[1] + r[3] / 2.0);
+        drag(&mut rt, at(&user.rect), centre(&user.rect));
+        let picked = rt.selected_text().expect("a drag selects transcript text");
+        assert!(
+            picked.contains("the crate"),
+            "selected the drag: {picked:?}"
+        );
+        let clipboard = rune::clipboard::memory();
+        rt.use_clipboard(&clipboard);
+        rt.key(rune::KeyEvent {
+            key: rune::Key::Command('c'),
+            mods: rune::Mods {
+                cmd: true,
+                ..rune::Mods::default()
+            },
+        });
+        tick(&mut rt);
+        assert_eq!(
+            clipboard.text().map(|t| t.as_str() == picked),
+            Some(true),
+            "Ctrl+C copied the selection"
+        );
+        // A new drag inside the reply replaces the selection (markdown is one selection group
+        // per message, so its paragraphs and code blocks select together).
+        drag(&mut rt, at(&reply.rect), centre(&reply.rect));
+        let picked = rt.selected_text().expect("a drag selects the reply");
+        assert!(picked.contains("nine"), "selected the reply: {picked:?}");
+    }
+
+    #[test]
+    fn a_plain_click_clears_the_selection() {
+        let mut rt = rt();
+        let user = element(&rt, "List the crates in this repo");
+        drag(
+            &mut rt,
+            (user.rect[0] + 4.0, user.rect[1] + user.rect[3] / 2.0),
+            centre(&user.rect),
+        );
+        assert!(rt.selected_text().is_some());
+        let reply = element(&rt, "There are nine crates here.");
+        let c = centre(&reply.rect);
+        rt.pointer_move(c.0, c.1);
+        tick(&mut rt);
+        rt.pointer_down(c.0, c.1);
+        tick(&mut rt);
+        rt.pointer_up(c.0, c.1);
+        tick(&mut rt);
+        assert_eq!(rt.selected_text(), None, "a press elsewhere clears it");
+    }
 }

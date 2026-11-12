@@ -1,11 +1,11 @@
-//! The landing page, as drawn in Paper (`DESIGN.md`, dex / Home v2): a greeting, the threads
-//! touched in the last two days, a column of counts, and the start actions.
+//! The landing page, as drawn in Paper (`DESIGN.md`, dex / Home v3): a greeting, a stats row,
+//! the issue field (the composer of the next thread), and the threads touched in the last two
+//! days behind a "Show more".
 
 use chrono::{Local, NaiveDate, Timelike};
-use rune::{El, ScrollSpec, col, el, row, text};
-use rune_kit::{IconButton, IconButtonVariant, Kit};
+use rune::{Cursor, El, ScrollSpec, col, el, row, spacer, text, text_input};
+use rune_kit::Kit;
 
-use crate::icons;
 use crate::sidebar::ago;
 use crate::state::{Cmd, Page, State, project_name, session_title};
 use crate::style::{caps, rule, space, typo};
@@ -17,44 +17,64 @@ fn local_date(updated_at: &str) -> Option<NaiveDate> {
         .map(|t| t.with_timezone(&Local).date_naive())
 }
 
+/// One stat in the strip under the greeting: a colored dot, the number, the label.
 fn stat(k: &Kit, n: usize, label: &str, color: rune::Color) -> El {
+    row()
+        .gap(space::XS)
+        .items_center()
+        .child(el().size(6.0, 6.0).radius(3.0).fill(color))
+        .child(text(n.to_string()).font(k.ty.ui).color(k.c.text_base))
+        .child(text(label.to_string()).font(k.ty.ui).color(k.c.text_muted))
+}
+
+/// The issue field's card: the input, the mode and model chips, and the Enter hint.
+fn issue_card(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
+    let input = text_input(&s.issue, k.ty.body.lh(22.0))
+        .key("issue-input")
+        .placeholder("Write an issue…", k.c.text_faint)
+        .caret(k.c.text_base, k.c.border_focus.alpha(0.35))
+        .color(k.c.text_base)
+        .on_edit(|s: &mut State| &mut s.issue)
+        .on_submit(|s: &mut State, _| s.submit_issue())
+        .w_full()
+        .px(space::MD)
+        .py(space::MD)
+        .min_h(44.0);
+    let mode = crate::composer_menu::mode(s, k, layer);
+    let model = crate::composer_menu::model(s, k, layer);
     col()
         .w_full()
-        .gap(space::SM)
-        .py(18.0)
-        .child(text(n.to_string()).font(typo::stat(k)).color(color))
+        .padding(space::XS)
+        .gap(space::XXS)
+        .radius(k.radius.xl)
+        .fill(k.c.layer_02)
+        .border(1.0, k.c.border_base)
+        .child(input)
         .child(
-            text(label.to_string())
-                .font(typo::caption(k))
-                .color(k.c.text_faint),
+            // Chip text lands on the card edge + 12, the input's content line.
+            row()
+                .w_full()
+                .min_w(0.0)
+                .gap(space::MD)
+                .items_center()
+                .pr(space::MD)
+                .pb(space::MD)
+                .child(crate::composer_menu::project(s, k))
+                .child(mode)
+                .child(model)
+                .child(spacer())
+                .child(
+                    rune_kit::IconButton::new(&crate::icons::UP)
+                        .variant(rune_kit::IconButtonVariant::Submit)
+                        .label("Send")
+                        .on_press(|s: &mut State| s.submit_issue())
+                        .build(k)
+                        .key("issue-send"),
+                ),
         )
-        .child(rule(k).mt(18.0))
 }
 
-fn action(k: &Kit, label: &str, primary: bool, key: &str, f: impl Fn(&mut State) + 'static) -> El {
-    let (fill, ink) = if primary {
-        (theme::accent(), theme::on_accent())
-    } else {
-        (rune::Color::TRANSPARENT, k.c.text_base)
-    };
-    let mut b = row()
-        .key(key.to_string())
-        .px(space::XXL)
-        .py(space::LG)
-        .gap(space::MD)
-        .items_center()
-        .radius(k.radius.md)
-        .fill(fill);
-    if primary {
-        b = b.child(rune::icon(&icons::PLUS, 16.0).color(ink));
-    } else {
-        b = b.border(1.0, k.c.border_strong);
-    }
-    b = b.child(text(label.to_string()).font(k.ty.ui_medium).color(ink));
-    k.interactive(b).on_press(f)
-}
-
-pub fn home(s: &State, k: &Kit) -> El {
+pub fn home(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     let now = Local::now();
     let greeting = match now.hour() {
         5..=11 => "Good morning",
@@ -76,32 +96,42 @@ pub fn home(s: &State, k: &Kit) -> El {
         .collect();
     projects.sort_unstable();
     projects.dedup();
-    let running = usize::from(s.busy());
 
-    let toggle = IconButton::new(&icons::PANEL)
-        .variant(IconButtonVariant::Ghost)
+    let toggle = rune_kit::IconButton::new(&crate::icons::PANEL)
+        .variant(rune_kit::IconButtonVariant::Ghost)
         .label("Toggle sidebar")
         .on_press(|s: &mut State| s.sidebar = !s.sidebar)
         .build(k)
         .key("home-toggle");
 
     let subtitle = match dated.len() {
-        0 => "Nothing moved in the last two days.".to_string(),
-        1 => "One thread moved in the last two days. Pick up where you left off.".to_string(),
-        n => format!("{n} threads moved in the last two days. Pick up where you left off."),
+        0 => "Nothing moved in the last two days. Write a new issue.".to_string(),
+        1 => "One thread moved in the last two days. Pick one up or write a new issue.".to_string(),
+        n => format!("{n} threads moved in the last two days. Pick one up or write a new issue."),
     };
 
-    // Recent: threads touched in the last two days, newest first.
+    // Stats strip: waiting on you, threads running, projects.
+    let stats = row()
+        .gap(space::XL + space::LG)
+        .items_center()
+        .pt(space::XL)
+        .pb(space::XL)
+        .child(stat(k, s.needs.len(), "waiting on you", theme::waiting()))
+        .child(stat(k, s.running.len(), "threads running", theme::accent()))
+        .child(stat(k, projects.len(), "projects", theme::done()));
+
+    // Recent: threads touched in the last two days, newest first. Six show until "Show more".
+    let shown = if s.show_more { dated.len() } else { 6 };
     let mut recent = col().w_full().child(rule(k));
     if dated.is_empty() {
         recent = recent.child(
-            text("Start a thread to see it here.")
+            text("Write an issue above to see it here.")
                 .font(k.ty.body)
                 .color(k.c.text_muted)
                 .py(20.0),
         );
     }
-    for (i, (sess, _)) in dated.iter().take(6).enumerate() {
+    for (i, (sess, _)) in dated.iter().take(shown).enumerate() {
         let id = sess.session_id.clone();
         let cwd = sess.cwd.clone();
         let when = ago(&sess.updated_at);
@@ -110,7 +140,7 @@ pub fn home(s: &State, k: &Kit) -> El {
             .w_full()
             .min_w(0.0)
             .h(56.0)
-            .px(space::LG)
+            .px(10.0)
             .gap(space::XL)
             .items_center()
             .child(
@@ -140,47 +170,13 @@ pub fn home(s: &State, k: &Kit) -> El {
         }));
         recent = recent.child(rule(k));
     }
-
-    let week = col()
-        .w(200.0)
-        .child(caps(k, "THIS WEEK").pb(space::XL))
-        .child(
-            col()
-                .w_full()
-                .child(rule(k))
-                .child(stat(
-                    k,
-                    dated.len(),
-                    "threads active in two days",
-                    k.c.text_base,
-                ))
-                .child(stat(k, projects.len(), "projects", k.c.text_base))
-                .child(stat(k, running, "running now", theme::waiting())),
+    if !s.show_more && dated.len() > shown {
+        let more = text("Show more").font(k.ty.ui).color(k.c.text_muted);
+        recent = recent.child(
+            k.interactive(more.px(10.0).py(12.0).cursor(Cursor::Pointer))
+                .on_press(|s: &mut State| s.show_more = true),
         );
-
-    let continue_cwd = s
-        .sessions
-        .iter()
-        .find(|x| s.is_visible(x))
-        .map(|x| (x.session_id.clone(), x.cwd.clone()));
-    let mut actions = row().w_full().gap(space::LG).items_center().child(action(
-        k,
-        "New thread",
-        true,
-        "start-new",
-        |s| {
-            s.page = Page::Thread;
-            s.send_cmd(Cmd::NewSession);
-        },
-    ));
-    if let Some((id, cwd)) = continue_cwd {
-        actions = actions.child(action(k, "Continue last", false, "start-last", move |s| {
-            s.project = Some(cwd.clone());
-            s.page = Page::Thread;
-            s.send_cmd(Cmd::Open(id.clone()));
-        }));
     }
-    actions = actions.child(text("Ctrl N").font(typo::time(k)).color(k.c.text_faint));
 
     let content = col()
         .w_full()
@@ -199,27 +195,21 @@ pub fn home(s: &State, k: &Kit) -> El {
         )
         .child(
             text(subtitle)
+                .wrap()
+                .w_full()
                 .font(k.ty.body)
                 .color(k.c.text_muted)
                 .pt(space::MD),
         )
+        .child(stats)
+        .child(issue_card(s, k, layer).mt(space::XXL))
         .child(
-            row()
+            col()
                 .w_full()
-                .gap(64.0)
-                .items_start()
-                .pt(56.0)
-                .child(
-                    col()
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .child(caps(k, "RECENT").pb(space::XL))
-                        .child(recent),
-                )
-                .child(week),
-        )
-        .child(el().grow(1.0))
-        .child(actions.pt(40.0));
+                .pt(space::XXL)
+                .child(caps(k, "RECENT").pb(space::XL))
+                .child(recent),
+        );
 
     col()
         .w_full()

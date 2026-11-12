@@ -64,13 +64,6 @@ pub mod typo {
         }
         .lh(68.0)
     }
-    /// Home stat numbers.
-    pub fn stat(k: &Kit) -> TextStyle {
-        TextStyle {
-            size: 40.0,
-            ..k.ty.body_medium
-        }
-    }
 }
 
 /// Spacing scale, in points: gaps and paddings use these names, never raw numbers. Odd one-offs

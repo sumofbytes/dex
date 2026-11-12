@@ -4,7 +4,7 @@ use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 
 use dex_client::protocol::{ApprovalDecision, Question, QuestionAnswer, SessionInfo, StreamEvent};
-use rune::{TextEdit, Waker};
+use rune::{FileDialogOptions, TextEdit, Tx, Waker};
 use rune_kit::diff::{DiffState, parse};
 use tokio::sync::mpsc;
 
@@ -141,7 +141,7 @@ pub enum Item {
     },
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Page {
     Home,
     Thread,
@@ -232,8 +232,12 @@ pub struct State {
     pub current: Option<String>,
     pub items: Vec<Item>,
     pub edit: TextEdit,
+    /// The Home page's issue field: the composer of the next thread (`submit_issue`).
+    pub issue: TextEdit,
     /// The composer text as of the last poll: a change asks for one more frame (see `poll`).
     pub edit_seen: String,
+    /// RECENT shows six threads until "Show more" widens the list.
+    pub show_more: bool,
     pub status: String,
     pub info: Info,
     pub model: Option<String>,
@@ -301,7 +305,9 @@ impl Default for State {
             current: None,
             items: Vec::new(),
             edit: TextEdit::default(),
+            issue: TextEdit::default(),
             edit_seen: String::new(),
+            show_more: false,
             sending: false,
             status: "starting…".into(),
             info: Info::default(),
@@ -431,6 +437,30 @@ impl State {
     pub fn hide_project(&mut self, root: &str) {
         self.hidden_projects.insert(root.to_string());
         self.save_hidden();
+    }
+
+    /// The sidebar's `+`: open the platform's folder picker; the picked folder becomes
+    /// the next thread's project.
+    pub fn pick_project(&mut self, tx: &mut Tx) {
+        tx.open_folder(
+            FileDialogOptions {
+                title: "Add project".into(),
+                ..FileDialogOptions::default()
+            },
+            |s: &mut State, result, _| match result {
+                Ok(Some(path)) => s.add_project(path),
+                Ok(None) => {} // cancelled
+                Err(e) => s.status = format!("add project: {e}"),
+            },
+        );
+    }
+
+    /// A picked folder is the next thread's project: a fresh thread opens in it, and it
+    /// lists in the sidebar (the open thread's directory) until its first turn arrives.
+    pub fn add_project(&mut self, path: std::path::PathBuf) {
+        self.project = Some(path.display().to_string());
+        self.page = Page::Thread;
+        self.send_cmd(Cmd::NewSession);
     }
 
     /// Switch colour scheme and remember it in the data directory.
@@ -1174,6 +1204,30 @@ impl State {
         self.edit.replace_text(q.text);
     }
 
+    /// Enter on the Home page's issue field: start a thread in the project's cwd with the
+    /// issue as its first message.
+    pub fn submit_issue(&mut self) {
+        let text = self.issue.text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        let cwd = self.cwd();
+        self.project = Some(cwd.clone());
+        self.page = Page::Thread;
+        self.issue.replace_text("");
+        self.show_more = false;
+        self.items.push(Item::User(text.clone()));
+        self.sending = true;
+        self.status = "working…".into();
+        self.send_cmd(Cmd::Send {
+            cwd,
+            text,
+            model: self.model.clone(),
+            permission: self.permission.clone(),
+            worktree: self.use_worktree && self.current.is_none(),
+        });
+    }
+
     pub fn submit(&mut self) {
         let text = self.edit.text.trim().to_string();
         if text.is_empty() {
@@ -1447,6 +1501,27 @@ mod tests {
             "hi there"
         );
         assert_eq!(session_title(&sess(None, false, None)), "Untitled");
+    }
+
+    #[test]
+    fn add_project_opens_a_fresh_thread_in_the_picked_folder() {
+        let mut s = State::default();
+        s.add_project("/home/x/repo".into());
+        assert_eq!(s.project.as_deref(), Some("/home/x/repo"));
+        assert_eq!(s.page, Page::Thread);
+        // The daemon's reply for the new thread: empty id until Send creates it.
+        s.apply(Msg::Opened {
+            id: String::new(),
+            replay: Vec::new(),
+        });
+        assert_eq!(s.cwd(), "/home/x/repo");
+        // The picked project lists in the sidebar even before its first thread exists.
+        assert_eq!(
+            crate::sidebar::projects(&s)
+                .first()
+                .map(|(c, _)| c.as_str()),
+            Some("/home/x/repo")
+        );
     }
 
     #[test]

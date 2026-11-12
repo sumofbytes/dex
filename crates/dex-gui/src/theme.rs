@@ -14,11 +14,11 @@ const BUNDLE: &str = include_str!("../themes/schemes.txt");
 /// dex's own warm dark theme, the default.
 pub const DEFAULT: &str = "dex";
 
+/// A scheme is the three seeds (background, text, accent) `rune-kit` turns into its palette.
 #[derive(Clone, Copy)]
 struct Active {
     kit: &'static Kit,
     accent: Color,
-    on_accent: Color,
 }
 
 fn active() -> &'static RwLock<(String, Active)> {
@@ -35,7 +35,6 @@ fn build_dex() -> Active {
     Active {
         kit: leak(bg, fg, accent),
         accent,
-        on_accent: c("#2a1f1c"),
     }
 }
 
@@ -79,18 +78,9 @@ fn seeds(name: &str) -> Option<(Color, Color, Color)> {
 /// A scheme's seeds from its section of the bundle, ready to build a kit.
 fn build(name: &str) -> Option<Active> {
     let (bg, fg, accent) = seeds(name)?;
-    // Ink on the accent: whichever of background and text contrasts more with it.
-    let on_accent = if (bg.luminance() - accent.luminance()).abs()
-        >= (fg.luminance() - accent.luminance()).abs()
-    {
-        bg
-    } else {
-        fg
-    };
     Some(Active {
         kit: leak(bg, fg, accent),
         accent,
-        on_accent,
     })
 }
 
@@ -164,11 +154,6 @@ pub fn kit() -> &'static Kit {
 
 pub fn accent() -> Color {
     active().read().unwrap().1.accent
-}
-
-/// The accent button's ink on `accent()`.
-pub fn on_accent() -> Color {
-    active().read().unwrap().1.on_accent
 }
 
 /// A stable colour for a project name, from a small warm palette.
