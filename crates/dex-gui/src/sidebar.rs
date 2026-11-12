@@ -448,7 +448,29 @@ pub(crate) fn projects(s: &State) -> Vec<(String, Vec<&SessionInfo>)> {
     out
 }
 
-pub fn sidebar(s: &State, k: &Kit) -> El {
+/// The sidebar toggle. It lives in the sidebar's top row while the sidebar is open and at the
+/// start of the page header while it is closed, so it never moves relative to the window.
+pub fn toggle(k: &Kit) -> El {
+    IconButton::new(&icons::PANEL)
+        .variant(IconButtonVariant::Ghost)
+        .label("Toggle sidebar")
+        .on_press(|s: &mut State| s.sidebar = !s.sidebar)
+        .build(k)
+        .key("toggle-sidebar")
+}
+
+/// Leading padding of a titlebar-band row: past the traffic lights when the window has them
+/// (`inset` is `Cx::titlebar_inset`, 0 without them or in full screen), else `fallback`.
+pub fn lights_pad(inset: f32, fallback: f32) -> f32 {
+    if inset > 0.0 {
+        inset + space::MD
+    } else {
+        fallback
+    }
+}
+
+/// `inset` is `Cx::titlebar_inset`; the toggle and brand start past the traffic lights.
+pub fn sidebar(s: &State, k: &Kit, inset: f32) -> El {
     // Same band the chat pane's titlebar (`view.rs` header) gives its content: 46pt of brand +
     // the kit's 2pt header gap puts the hairline 48pt down, level with the titlebar's own rule.
     let brand = row()
@@ -457,12 +479,11 @@ pub fn sidebar(s: &State, k: &Kit) -> El {
         // Titlebar alignment: the hairline must land at 48pt, so the brand fills all but the
         // kit's 2pt `header_gap`, whatever `space::XXS` amounts to.
         .items_center()
-        .child(
-            text("dex")
-                .font(k.ty.body_medium)
-                .color(k.c.text_base)
-                .px(tok::PAD),
-        );
+        .gap(space::MD)
+        .pl(lights_pad(inset, tok::PAD))
+        .pr(tok::PAD)
+        .child(toggle(k))
+        .child(text("dex").font(k.ty.body_medium).color(k.c.text_base));
     // The header's items: the brand, then a hairline under it the way the chat pane's titlebar
     // carries one (same ink, full bleed), then the nav rows.
     let mut sb = Sidebar::new()

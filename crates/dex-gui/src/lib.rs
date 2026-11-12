@@ -584,7 +584,12 @@ pub fn run() -> bool {
     if !detach() {
         return false;
     }
-    rune::run(AppSpec::<State> {
+    // Lights centred on the 48pt titlebar band (their top-left is 17pt down for 14pt buttons).
+    let chrome = rune::Chrome {
+        traffic_lights: Some((16.0, 17.0)),
+        ..rune::Chrome::DEFAULT
+    };
+    rune::App::new(AppSpec::<State> {
         scenes: &[
             ("chat", sample),
             ("home", home_scene),
@@ -610,7 +615,9 @@ pub fn run() -> bool {
         fonts: rune_theme_opencode::FONTS,
         families: rune_theme_opencode::FAMILIES,
         ..AppSpec::new("dex", (1100.0, 760.0), State::default, view::view)
-    });
+    })
+    .chrome(chrome)
+    .run();
     true
 }
 
