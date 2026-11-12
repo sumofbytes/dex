@@ -80,12 +80,16 @@ pub(crate) async fn self_update_async() -> Result<String, String> {
             let resp = resp.error_for_status().map_err(|e| {
                 format!("cannot check the latest release (none published yet?): {e}")
             })?;
-            let tag = resp
+            let mut tag = resp
                 .url()
                 .path_segments()
                 .and_then(|mut segments| segments.next_back())
                 .unwrap_or_default()
                 .to_string();
+            if parse_version(&tag).is_none() {
+                // Proxies/mirrors may not redirect; ask the API instead.
+                tag = latest_tag_from_api(&client, &repo).await.unwrap_or(tag);
+            }
             let version = parse_version(&tag)
                 .ok_or_else(|| format!("no valid vX.Y.Z release found for {repo} (got '{tag}')"))?;
             (tag, version)
@@ -286,6 +290,25 @@ fn parse_version(tag: &str) -> Option<(u64, u64, u64)> {
         return None;
     }
     Some((major, minor, patch))
+}
+
+/// `tag_name` of the latest release via the GitHub API (redirect fallback).
+async fn latest_tag_from_api(client: &reqwest::Client, repo: &str) -> Option<String> {
+    let body = client
+        .get(format!(
+            "https://api.github.com/repos/{repo}/releases/latest"
+        ))
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .ok()?
+        .error_for_status()
+        .ok()?
+        .text()
+        .await
+        .ok()?;
+    let v: serde_json::Value = serde_json::from_str(&body).ok()?;
+    v.get("tag_name")?.as_str().map(str::to_string)
 }
 
 /// Expected sha256 for `asset` in a `sha256sum`-format file (`<hash>  <name>`).
