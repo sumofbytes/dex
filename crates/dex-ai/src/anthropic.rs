@@ -288,21 +288,6 @@ fn assistant_blocks(message: &ChatMessage) -> Vec<Value> {
     blocks
 }
 
-/// True when any assistant message would replay a thinking block on the
-/// wire (the same subset [`assistant_blocks`] forwards). Requests that
-/// drop the `thinking` parameter — e.g. cache-warming pings — must keep it
-/// enabled for such history: the API rejects thinking blocks without it.
-pub fn replays_thinking(messages: &[ChatMessage]) -> bool {
-    messages.iter().any(|message| {
-        message.reasoning_items.iter().flatten().any(|item| {
-            matches!(
-                item.get("type").and_then(Value::as_str),
-                Some("thinking") | Some("redacted_thinking")
-            )
-        })
-    })
-}
-
 /// OpenAI-shaped tool call → Anthropic `tool_use` block. `input` must be a
 /// JSON object; unparsable arguments degrade to `{}` rather than failing
 /// the whole request.

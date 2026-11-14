@@ -4,7 +4,6 @@ use super::{
 };
 
 use super::agent_wake_origin;
-use super::cache_warming_origin;
 use super::config_file_path;
 use super::context_index::catalog_context_window;
 use super::context_index::ctx_from_index;
@@ -536,13 +535,6 @@ fn shared_rows(
         ),
         None => row(out, "wake retries", "12", "built-in default"),
     }
-    let (warming, warming_source) = cache_warming_origin();
-    row(
-        out,
-        "cache warming",
-        if warming { "on" } else { "off" },
-        warming_source,
-    );
     // Headers: count per layer, sources joined.
     let mut header_count = 0;
     let mut header_sources: Vec<&str> = Vec::new();
