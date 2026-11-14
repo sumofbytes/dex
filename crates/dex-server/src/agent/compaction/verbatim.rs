@@ -46,12 +46,6 @@ pub(crate) const JEV_VALUE: &str = "jev";
 /// enum — so both readers share one parse.
 pub(crate) const COMPACTION_ENV: &str = "DEX_COMPACTION";
 
-/// Deprecated predecessor of [`COMPACTION_ENV`]: `DEX_COMPACTION_LLM=1`
-/// selected the LLM summarizer. Honored as an alias for
-/// `DEX_COMPACTION=llm` with a `warn_once` pointer so existing shells keep
-/// working after the rename.
-pub(crate) const LEGACY_COMPACTION_ENV: &str = "DEX_COMPACTION_LLM";
-
 /// Characters of a truncated result kept as head context.
 pub(crate) const JEV_TRUNCATE_HEAD_CHARS: usize = 300;
 
@@ -107,8 +101,6 @@ pub(crate) fn parse_compaction_knob(raw: &str) -> CompactionKnob {
 /// unset/explicit offs → [`SummaryMode::Deterministic`]. A non-empty
 /// unrecognized value warns once (a typo like `=jve` must not silently
 /// degrade to deterministic) and likewise falls back to deterministic.
-/// The deprecated `DEX_COMPACTION_LLM=1` is honored as `llm` with a
-/// `warn_once` pointer when `DEX_COMPACTION` itself is unset/empty.
 pub(crate) fn summary_mode() -> SummaryMode {
     let raw = std::env::var(COMPACTION_ENV).unwrap_or_default();
     if !raw.trim().is_empty() {
@@ -126,21 +118,13 @@ pub(crate) fn summary_mode() -> SummaryMode {
             }
         }
     }
-    if std::env::var(LEGACY_COMPACTION_ENV).as_deref() == Ok("1") {
-        warn_once(
-            "env:DEX_COMPACTION_LLM",
-            "DEX_COMPACTION_LLM=1 is deprecated — use DEX_COMPACTION=llm",
-        );
-        return SummaryMode::Llm;
-    }
     SummaryMode::Deterministic
 }
 
 /// `dex doctor` origin row for the threshold-compaction knob: the value
 /// names the mode that runs, the source names the env var whenever it is
 /// set (even to an explicit off or a warned-about typo — the value still
-/// reports what runs), the deprecated `DEX_COMPACTION_LLM` when the mode
-/// comes from that fallback, or the built-in default when unset/empty.
+/// reports what runs), or the built-in default when unset/empty.
 pub(crate) fn compaction_doctor() -> (String, String) {
     let value = match summary_mode() {
         SummaryMode::Jev => "verbatim prune (jev)",
@@ -153,8 +137,6 @@ pub(crate) fn compaction_doctor() -> (String, String) {
         .is_some_and(|v| !v.trim().is_empty())
     {
         COMPACTION_ENV.to_string()
-    } else if std::env::var(LEGACY_COMPACTION_ENV).as_deref() == Ok("1") {
-        format!("{LEGACY_COMPACTION_ENV} (deprecated, use {COMPACTION_ENV})")
     } else {
         "built-in default".to_string()
     };
@@ -891,8 +873,6 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let prev = std::env::var_os(COMPACTION_ENV);
-        let legacy_prev = std::env::var_os(LEGACY_COMPACTION_ENV);
-        std::env::remove_var(LEGACY_COMPACTION_ENV);
         std::env::set_var(COMPACTION_ENV, "jev");
         assert_eq!(summary_mode(), SummaryMode::Jev);
         assert!(summary_mode().prunes_jev());
@@ -918,23 +898,9 @@ mod tests {
         assert!(!summary_mode().prunes_jev());
         std::env::remove_var(COMPACTION_ENV);
         assert_eq!(summary_mode(), SummaryMode::Deterministic);
-        // Deprecated `DEX_COMPACTION_LLM=1` still selects the LLM mode
-        // when the new knob is unset, and the new knob wins when set.
-        std::env::remove_var(COMPACTION_ENV);
-        std::env::set_var(LEGACY_COMPACTION_ENV, "1");
-        assert_eq!(summary_mode(), SummaryMode::Llm);
-        let (value, source) = compaction_doctor();
-        assert_eq!(value, "LLM summary");
-        assert!(source.contains(LEGACY_COMPACTION_ENV), "{source}");
-        std::env::set_var(COMPACTION_ENV, "jev");
-        assert_eq!(summary_mode(), SummaryMode::Jev);
         match prev {
             Some(v) => std::env::set_var(COMPACTION_ENV, v),
             None => std::env::remove_var(COMPACTION_ENV),
-        }
-        match legacy_prev {
-            Some(v) => std::env::set_var(LEGACY_COMPACTION_ENV, v),
-            None => std::env::remove_var(LEGACY_COMPACTION_ENV),
         }
     }
 
