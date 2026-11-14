@@ -438,9 +438,9 @@ fn work_block(s: &State, k: &Kit, start: usize, end: usize) -> El {
     let toggle_head = k.interactive(head).on_press(open_toggle);
     let mut group = col().w_full().gap(space::XS).child(toggle_head);
     if open {
-        for i in start..end {
+        for (i, entry) in s.items.iter().enumerate().take(end).skip(start) {
             // Thoughts inside a block are plain rows: the block's header carries the spinner.
-            group = group.child(item(i, &s.items[i], k).key(format!("item{i}")).pl(NESTED));
+            group = group.child(item(i, entry, k).key(format!("item{i}")).pl(NESTED));
         }
     }
     group
