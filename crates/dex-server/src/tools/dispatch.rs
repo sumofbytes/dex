@@ -244,7 +244,6 @@ async fn dispatch_tool(
     }
     if crate::extensions::is_extension_tool(name) {
         // Same audit contract as MCP: the raw string lands in the one row.
-        // (`call_global` normalizes the deprecated `lua__` alias.)
         return crate::extensions::call_global(name, args, cancel, policy, filter)
             .await
             .map_err(ToolError::Internal);

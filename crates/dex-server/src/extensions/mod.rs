@@ -56,9 +56,7 @@ pub use manager::{install, remove};
 
 #[cfg(test)]
 use appendix::full_tool_name;
-pub use appendix::{
-    is_extension_tool, normalize_tool_name, prompt_appendix, push_prompt_appendix, split_ext_name,
-};
+pub use appendix::{is_extension_tool, prompt_appendix, push_prompt_appendix, split_ext_name};
 #[cfg(test)]
 use appendix::{remove_prompt_appendix, PROMPT_APPENDIX};
 pub use discovery::{config_extension_paths, set_enabled, set_extra_dirs};
