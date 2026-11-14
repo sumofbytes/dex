@@ -64,7 +64,7 @@ pub use extension_model::{
 };
 pub use headers::{
     apply_opencode_session_headers, custom_headers_from_env, insert_extra_header,
-    insert_parsed_headers, load_config_headers, merge_header_layers, parse_headers_str,
+    insert_parsed_headers, merge_header_layers, parse_headers_str,
 };
 pub use permission::permission_from_env;
 pub use prompt_source::{resolve_cli_system_prompt, system_prompt_origin};
@@ -131,6 +131,11 @@ pub fn load_config_file() -> Option<serde_yaml::Value> {
                             msg.push_str(
                                 " — 'routing:' is no longer read: set 'model:' directly",
                             );
+                        }
+                        for (key, hint) in REMOVED_FILE_KEYS {
+                            if unknown.contains(key) {
+                                msg.push_str(&format!(" — '{key}:' was removed: {hint}"));
+                            }
                         }
                         if unknown
                             .iter()
@@ -335,12 +340,41 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "harness_profile",
     "harness_profiles",
     "jev",
-    // Deprecated but still honored for old files:
-    "base_url",
-    "api",
-    "headers",
-    "http_headers",
 ];
+
+/// Top-level keys that were removed in favor of `providers.<name>.*`. Unlike
+/// a typo, silently ignoring one would misroute requests (`base_url:`) or
+/// drop auth headers, so `from_env` refuses to start and names the
+/// replacement.
+const REMOVED_FILE_KEYS: &[(&str, &str)] = &[
+    (
+        "base_url",
+        "set 'base_url:' under the provider's entry in 'providers:'",
+    ),
+    (
+        "api",
+        "set 'api:' under the provider's entry in 'providers:'",
+    ),
+    (
+        "headers",
+        "use 'headers:' under the provider's entry in 'providers:' or DEX_HEADERS (global)",
+    ),
+    (
+        "http_headers",
+        "use 'headers:' under the provider's entry in 'providers:' or DEX_HEADERS (global)",
+    ),
+];
+
+/// The error for a config file that still carries a [`REMOVED_FILE_KEYS`] key.
+fn removed_keys_error(file: &Option<serde_yaml::Value>) -> Option<String> {
+    let map = file.as_ref()?.as_mapping()?;
+    let found: Vec<String> = REMOVED_FILE_KEYS
+        .iter()
+        .filter(|(key, _)| map.contains_key(*key))
+        .map(|(key, hint)| format!("top-level '{key}:' was removed — {hint}"))
+        .collect();
+    (!found.is_empty()).then(|| format!("invalid config: {}", found.join("; ")))
+}
 
 /// The `agent_wake` knob (§10b V1b): when a completion notice is queued
 /// while the session is idle and a client is plausibly listening, the
@@ -457,16 +491,9 @@ pub struct LlmConfig {
     /// Extra HTTP headers sent on every provider request (gateway auth,
     /// routing, attribution). env (`ANTHROPIC_CUSTOM_HEADERS`/`OPENAI_HEADERS`/
     /// `DEX_HEADERS`) < `--header` / per-request overrides — these beat both
-    /// file layers on the wire (see `merged_headers`). The global file
-    /// `headers:`/`http_headers:` table lives in `global_headers`. Never
-    /// carries `authorization` (the api key owns that) — dropped at send time.
+    /// the provider-scoped file headers on the wire (see `merged_headers`).
+    /// Never carries `authorization` (the api key owns that) — dropped at send time.
     pub extra_headers: BTreeMap<String, String>,
-    /// Global config-file `headers:`/`http_headers:` (the lowest precedence
-    /// layer: provider-scoped file headers and env/CLI extras both beat it,
-    /// per key). Split from `extra_headers` so the wire merge in
-    /// `merged_headers` can order the three layers exactly like
-    /// `extension_model_auth_for` does.
-    pub global_headers: BTreeMap<String, String>,
     /// Timeout knobs, not a client: the wire goes through
     /// [`LlmConfig::http_client`], which shares the process-wide streaming
     /// client on defaults and builds a bounded one only when
@@ -488,17 +515,11 @@ pub struct LlmConfig {
 /// default (`anthropic` → anthropic-messages); OpenAI-compatible ones
 /// fall back to the responses default with the empirical completions
 /// fallback.
-pub fn base_protocol(
-    provider: &Provider,
-    api_pin: Option<ApiProtocol>,
-    file: &Option<serde_yaml::Value>,
-) -> (ApiProtocol, bool) {
-    let file_pin = load_config_str(file, "api");
+pub fn base_protocol(provider: &Provider, api_pin: Option<ApiProtocol>) -> (ApiProtocol, bool) {
     let api = api_pin
-        .or(file_pin.as_deref().and_then(ApiProtocol::parse))
         .or_else(|| provider.default_api())
         .unwrap_or(ApiProtocol::Responses);
-    (api, file_pin.is_some() || api_pin.is_some())
+    (api, api_pin.is_some())
 }
 
 /// Nothing anywhere names a provider/model/endpoint: the "no provider
@@ -625,12 +646,12 @@ impl LlmConfig {
             None => permission_from_env()?,
         };
         let file = load_config_file();
-        // Custom headers, three layers merged by `merge_header_layers`
-        // (AGENTS.md precedence): global file table
-        // < provider-scoped < env < CLI. `extra_headers` carries env+CLI (and
-        // later per-request overrides); the file's global table rides in
-        // `global_headers`.
-        let global_headers = load_config_headers(&file);
+        if let Some(error) = removed_keys_error(&file) {
+            return Err(error.into());
+        }
+        // Custom headers, merged by `merge_header_layers` (AGENTS.md
+        // precedence): provider-scoped < env < CLI. `extra_headers` carries
+        // env+CLI (and later per-request overrides).
         let mut extra_headers = BTreeMap::new();
         for (k, v) in custom_headers_from_env() {
             insert_extra_header(&mut extra_headers, &k, &v);
@@ -688,24 +709,16 @@ impl LlmConfig {
         let provider = provider_from_name(&provider_name, &known)
             .unwrap_or_else(|| Provider::Generic(provider_name.to_ascii_lowercase()));
         let mut available_models = env_models();
-        let file_base_url = load_config_str(&file, "base_url");
-        if file_base_url.is_some() {
-            warn_once(
-                "config:base_url",
-                "top-level config key 'base_url:' is deprecated — set 'base_url:' under the provider's entry in 'providers:'",
-            );
-        }
-        // An explicit base_url (`--base-url`, file `base_url:`) pins the
-        // endpoint — routing may not silently rewire what the user set.
-        // Only the fallback default (nothing set anywhere) routes.
-        let explicit_base_url = base_url_override.is_some() || file_base_url.is_some();
+        // An explicit `--base-url` pins the endpoint — routing may not
+        // silently rewire what the user set. Only the fallback default
+        // (nothing set anywhere) routes.
+        let explicit_base_url = base_url_override.is_some();
         // One derivation for everything provider-scoped; an explicit
-        // base_url (CLI/file) pins the endpoint and covers a missing
+        // `--base-url` pins the endpoint and covers a missing
         // landing, otherwise the landing is required — fail loudly instead
         // of pointing requests at "".
         let resolved = resolve_provider(&provider, &provider_entries);
         let base_url = base_url_override
-            .or(file_base_url)
             .filter(|v| !v.is_empty())
             .or(resolved.landing.clone())
             .filter(|v| !v.is_empty())
@@ -715,21 +728,9 @@ impl LlmConfig {
                     provider.name()
                 )
             })?;
-        // Wire protocol default: the active provider's `api:` entry pin,
-        // else the global file `api:`, else responses. A typo'd file `api:`
-        // fails fast instead of silently defaulting.
-        if let Some(name) = load_config_str(&file, "api") {
-            warn_once(
-                "config:api",
-                "top-level config key 'api:' is deprecated — set 'api:' under the provider's entry in 'providers:'",
-            );
-            ApiProtocol::parse(&name).ok_or_else(|| {
-                format!("unsupported api '{name}'; use openai-completions, openai-responses or anthropic-messages")
-            })?;
-        }
         // Baked once: hot paths read the fields instead of re-reading the
         // file on every request.
-        let (api, api_pinned) = base_protocol(&provider, resolved.api_pin, &file);
+        let (api, api_pinned) = base_protocol(&provider, resolved.api_pin);
         // The model carries its own wire protocol; the global `api` above is
         // only the default. Otherwise the `apply_model` call below resolves
         // (full `endpoint/id` key, then bare id, then learned fallback).
@@ -778,7 +779,6 @@ impl LlmConfig {
             verify_command: env::var("DEX_VERIFY").ok(),
             permission,
             extra_headers,
-            global_headers,
             connect_timeout_secs,
             request_timeout_secs,
             prompt_cache_key: None,
@@ -1045,7 +1045,7 @@ impl LlmConfig {
     /// Base wire protocol + baked pin from an entry pin, re-reading the
     /// global file `api:` (cached). Per-model overrides apply on top.
     fn refresh_protocol(&mut self, api_pin: Option<ApiProtocol>) {
-        let (api, pinned) = base_protocol(&self.provider, api_pin, &load_config_file());
+        let (api, pinned) = base_protocol(&self.provider, api_pin);
         self.api = api;
         self.api_pinned = pinned;
     }

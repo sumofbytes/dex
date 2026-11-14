@@ -216,7 +216,6 @@ pub fn test_cfg() -> LlmConfig {
         permission: PermissionMode::Ask,
         verify_command: None,
         extra_headers: Default::default(),
-        global_headers: Default::default(),
         connect_timeout_secs: 10,
         request_timeout_secs: 300,
         prompt_cache_key: None,
@@ -623,13 +622,13 @@ fn custom_headers_layer_file_env_cli() {
         "OPENAI_HEADERS",
         "ANTHROPIC_CUSTOM_HEADERS",
     ]);
-    // Config file: `headers:` wins per-key over `http_headers:`.
+    // Config file: provider-scoped `headers:` are the lowest layer.
     let dir = std::env::temp_dir().join(format!("dex-headers-{}", std::process::id()));
     let _ = std::fs::create_dir_all(&dir);
     let cfg_path = dir.join("config.yaml");
     std::fs::write(
             &cfg_path,
-            "model: opencode/m-h\ncontext_window: 1000\nproviders:\n  opencode:\n    base_url: https://opencode.example/v1\n    api_key: test-key\nhttp_headers:\n  X-File: file\n  X-Shared: http\nheaders:\n  X-Shared: file\n",
+            "model: opencode/m-h\ncontext_window: 1000\nproviders:\n  opencode:\n    base_url: https://opencode.example/v1\n    api_key: test-key\n    headers:\n      X-File: file\n      X-Shared: file\n",
         )
         .unwrap();
     std::env::set_var("DEX_CONFIG", &cfg_path);
@@ -646,17 +645,17 @@ fn custom_headers_layer_file_env_cli() {
     )
     .unwrap();
     assert_eq!(cfg.model, "m-h");
-    // File layers land in `global_headers` (lowest precedence on the
-    // wire); `http_headers:` loses to `headers:` per key inside that map.
+    // The file layer lands in `provider_headers` (lowest precedence on the
+    // wire).
     assert_eq!(
-        cfg.global_headers.get("X-File").map(String::as_str),
+        cfg.provider_headers.get("X-File").map(String::as_str),
         Some("file")
     );
     assert_eq!(
-        cfg.global_headers.get("X-Shared").map(String::as_str),
+        cfg.provider_headers.get("X-Shared").map(String::as_str),
         Some("file")
     );
-    // Env / CLI land in `extra_headers` — above both file layers.
+    // Env / CLI land in `extra_headers` — above the file layer.
     assert_eq!(
         cfg.extra_headers.get("X-Env").map(String::as_str),
         Some("env")
@@ -674,21 +673,18 @@ fn custom_headers_layer_file_env_cli() {
         Some("cli")
     );
     assert!(!cfg.extra_headers.contains_key("X-File"));
-    // The wire merge orders the layers: CLI wins over both config-file
-    // spellings, file keys survive where nothing above them speaks.
-    let merged: BTreeMap<String, String> = crate::llm::http::merged_headers(
-        &cfg.global_headers,
-        &cfg.provider_headers,
-        &cfg.extra_headers,
-    )
-    .into_iter()
-    .map(|(name, value)| {
-        (
-            name.as_str().to_string(),
-            value.to_str().unwrap_or("").to_string(),
-        )
-    })
-    .collect();
+    // The wire merge orders the layers: CLI wins over the config file,
+    // file keys survive where nothing above them speaks.
+    let merged: BTreeMap<String, String> =
+        crate::llm::http::merged_headers(&cfg.provider_headers, &cfg.extra_headers)
+            .into_iter()
+            .map(|(name, value)| {
+                (
+                    name.as_str().to_string(),
+                    value.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
     assert_eq!(merged.get("x-shared").map(String::as_str), Some("cli"));
     assert_eq!(merged.get("x-file").map(String::as_str), Some("file"));
     let _ = std::fs::remove_dir_all(&dir);
@@ -696,24 +692,23 @@ fn custom_headers_layer_file_env_cli() {
 
 #[test]
 fn custom_headers_config_text_and_list_shapes() {
-    use super::load_config_headers;
+    use super::headers::config_headers_map;
     // Text-header block (same syntax as env vars / `--header`).
     let file: Option<serde_yaml::Value> =
         Some(serde_yaml::from_str("headers: \"X-A: one\\nX-B: two, three\"\n").unwrap());
-    let out = load_config_headers(&file);
+    let out = config_headers_map(&file, "headers");
     assert_eq!(out.get("X-A").map(String::as_str), Some("one"));
     assert_eq!(out.get("X-B").map(String::as_str), Some("two, three"));
     // List mixing text entries and one-key maps; later entries win.
-    let file: Option<serde_yaml::Value> = Some(
-        serde_yaml::from_str("http_headers:\n  - \"X-A: 1\"\n  - X-A: 2\n  - X-C: 3\n").unwrap(),
-    );
-    let out = load_config_headers(&file);
+    let file: Option<serde_yaml::Value> =
+        Some(serde_yaml::from_str("headers:\n  - \"X-A: 1\"\n  - X-A: 2\n  - X-C: 3\n").unwrap());
+    let out = config_headers_map(&file, "headers");
     assert_eq!(out.get("X-A").map(String::as_str), Some("2"));
     assert_eq!(out.get("X-C").map(String::as_str), Some("3"));
     // Non-string scalars and blank entries are skipped.
     let file: Option<serde_yaml::Value> =
         Some(serde_yaml::from_str("headers:\n  X-N: 42\n  X-E: \"\"\n").unwrap());
-    let out = load_config_headers(&file);
+    let out = config_headers_map(&file, "headers");
     assert_eq!(out.get("X-N").map(String::as_str), Some("42"));
     assert!(!out.contains_key("X-E"));
 }
@@ -1198,7 +1193,7 @@ fn opencode_key_resolves_entry_then_own_env_var() {
     std::env::set_var("XDG_CACHE_HOME", &dir);
     std::fs::write(
         dir.join("config.yaml"),
-        "model: opencode/m\ncontext_window: 1000\napi: openai-completions\nproviders:\n  opencode: {}\n",
+        "model: opencode/m\ncontext_window: 1000\nproviders:\n  opencode:\n    api: openai-completions\n",
     )
     .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
@@ -1222,7 +1217,7 @@ fn opencode_key_resolves_entry_then_own_env_var() {
     // Missing everywhere: the error points at the canonical names.
     std::fs::write(
         dir.join("config.yaml"),
-        "model: opencode/m\ncontext_window: 1000\napi: openai-completions\nproviders:\n  opencode: {}\n",
+        "model: opencode/m\ncontext_window: 1000\nproviders:\n  opencode:\n    api: openai-completions\n",
     )
     .unwrap();
     std::env::remove_var("OPENCODE_API_KEY");
@@ -1327,12 +1322,12 @@ fn config_file_defaults_apply() {
     let path = dir.join("config.yaml");
     std::fs::write(
             &path,
-            "base_url: https://file.example/v1\nmodel: opencode/file-model\ncontext_window: 1000\napi: openai-completions\ncustom_key: keep-me\nproviders:\n  opencode:\n    api_key: env-key\n    base_url: https://opencode.example/v1\n",
+            "model: opencode/file-model\ncontext_window: 1000\ncustom_key: keep-me\nproviders:\n  opencode:\n    api_key: env-key\n    base_url: https://file.example/v1\n    api: openai-completions\n",
         )
         .unwrap();
     std::env::set_var("DEX_CONFIG", &path);
     std::env::remove_var("OPENCODE_API_KEY");
-    // File model + file base_url + file api apply; a `--model`
+    // File model + provider base_url + provider api apply; a `--model`
     // override beats the file.
     let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
     assert_eq!(cfg.model, "file-model");
@@ -1474,10 +1469,10 @@ fn explicit_base_url_wins_over_catalog_routing() {
     .unwrap();
     assert_eq!(cfg.model, "m-go-only");
     assert_eq!(cfg.base_url, "https://opencode.ai/zen/v1");
-    // File `base_url:` pin with a file model.
+    // Provider-scoped `base_url:` with a file model.
     std::fs::write(
         dir.join("config.yaml"),
-        "base_url: https://opencode.ai/zen/v1\nmodel: opencode/m-go-only\nproviders:\n  opencode:\n    api_key: test-key\n",
+        "model: opencode/m-go-only\nproviders:\n  opencode:\n    api_key: test-key\n    base_url: https://opencode.ai/zen/v1\n",
     )
     .unwrap();
     let cfg = LlmConfig::from_env(None, None, None, &[]).unwrap();
@@ -1758,11 +1753,10 @@ fn persisted_selection_reloads_stripped() {
 
 #[test]
 fn pinned_base_url_still_resolves_per_model_protocol() {
-    // A file `base_url:` pins routing only: the per-model table and the
-    // learned fallback must still decide the wire protocol. Otherwise a
-    // persisted `/model go/<id>` (which always writes `base_url:`)
-    // retries `/responses` on every restart and a `DEX_MODEL_APIS` pin
-    // is ignored for the request yet blocks the fallback — the exact
+    // A provider `base_url:` sets routing only: the per-model table and the
+    // learned fallback must still decide the wire protocol. Otherwise the
+    // request retries `/responses` on every restart and a `DEX_MODEL_APIS`
+    // pin is ignored for the request yet blocks the fallback — the exact
     // error loop in the glm-5.3-flash report.
     let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
         .lock()
@@ -1779,10 +1773,9 @@ fn pinned_base_url_still_resolves_per_model_protocol() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(dir.join("cache/dex")).unwrap();
     std::fs::write(dir.join("cache/dex/models.dev.json"), "{}").unwrap();
-    // Persisted state after `/model go/m-go`: stripped id + pinned URL.
     std::fs::write(
         dir.join("config.yaml"),
-        "base_url: https://opencode.ai/zen/go/v1\nmodel: opencode/m-go\ncontext_window: 1000\nproviders:\n  opencode:\n    api_key: test-key\n",
+        "model: opencode/m-go\ncontext_window: 1000\nproviders:\n  opencode:\n    api_key: test-key\n    base_url: https://opencode.ai/zen/go/v1\n",
     )
     .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
@@ -2043,17 +2036,6 @@ fn api_pin_bakes_into_config() {
     std::fs::write(
             dir.join("config.yaml"),
             "model: opencode/m\ncontext_window: 1000\nproviders:\n  opencode:\n    api: openai-completions\n    api_key: test-key\n    base_url: https://opencode.example/v1\n",
-        )
-        .unwrap();
-    assert!(
-        LlmConfig::from_env(None, None, None, &[])
-            .unwrap()
-            .api_pinned
-    );
-    // A top-level `api:` pin still works too (deprecated but honored).
-    std::fs::write(
-            dir.join("config.yaml"),
-            "model: opencode/m\ncontext_window: 1000\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n    base_url: https://opencode.example/v1\n",
         )
         .unwrap();
     assert!(
@@ -2912,7 +2894,7 @@ fn extension_model_auth_merges_headers_and_drops_authorization() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
             dir.join("config.yaml"),
-            "model: myprov/m-7\nheaders:\n  X-A: global\n  authorization: Bearer file-key\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n    headers:\n      X-A: scoped\n      X-B: scoped\n",
+            "model: myprov/m-7\nproviders:\n  myprov:\n    base_url: https://myprov.example/v1\n    api_key: k-123\n    headers:\n      X-A: scoped\n      X-B: scoped\n      authorization: Bearer file-key\n",
         )
         .unwrap();
     std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
@@ -2921,9 +2903,8 @@ fn extension_model_auth_merges_headers_and_drops_authorization() {
         std::env::remove_var(key);
     }
     let auth = super::extension_model_auth().unwrap();
-    // Provider-scoped entries beat the global table per key (AGENTS.md
-    // precedence); `authorization` never travels with the headers (the
-    // key goes separately).
+    // `authorization` never travels with the headers (the key goes
+    // separately).
     assert_eq!(auth.headers.get("X-A").map(String::as_str), Some("scoped"));
     assert_eq!(auth.headers.get("X-B").map(String::as_str), Some("scoped"));
     assert!(auth
@@ -3273,4 +3254,38 @@ fn catalog_index_background_persist_pins_its_cache_dir() {
     let moved_path = moved_dir.join("dex/models.idx.json");
     assert!(!moved_path.exists(), "persist leaked into {moved_path:?}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn removed_top_level_config_keys_are_a_hard_error() {
+    let _env = crate::test_env::TEST_SESSIONS_ENV_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let _guard = EnvRestore::take(&["DEX_CONFIG", "OPENCODE_API_KEY", "XDG_CACHE_HOME"]);
+    let dir = std::env::temp_dir().join(format!("dex-removed-keys-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::env::set_var("XDG_CACHE_HOME", dir.join("cache"));
+    std::env::set_var("OPENCODE_API_KEY", "test-key");
+    std::env::set_var("DEX_CONFIG", dir.join("config.yaml"));
+    for key in ["base_url", "api", "headers", "http_headers"] {
+        std::fs::write(
+            dir.join("config.yaml"),
+            format!(
+                "model: opencode/m\ncontext_window: 1000\n{key}: x\nproviders:\n  opencode:\n    base_url: https://opencode.example/v1\n"
+            ),
+        )
+        .unwrap();
+        super::invalidate_config_cache();
+        let err = match LlmConfig::from_env(None, None, None, &[]) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("expected removed-key error for {key}"),
+        };
+        assert!(
+            err.contains(&format!("top-level '{key}:' was removed")),
+            "{err}"
+        );
+        assert!(err.contains("providers"), "{err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

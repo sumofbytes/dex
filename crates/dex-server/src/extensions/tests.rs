@@ -1057,7 +1057,6 @@ fn model_select_config(
         permission: crate::protocol::PermissionMode::Trusted,
         verify_command: None,
         extra_headers: Default::default(),
-        global_headers: Default::default(),
         connect_timeout_secs: 10,
         request_timeout_secs: 300,
         prompt_cache_key: None,

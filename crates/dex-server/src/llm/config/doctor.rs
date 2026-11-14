@@ -10,7 +10,6 @@ use super::context_index::catalog_context_window;
 use super::context_index::ctx_from_index;
 use super::context_index::dex_catalog_cache_path;
 use super::context_window_from_env;
-use super::headers::config_headers_map;
 use super::headers::custom_headers_from_env;
 use super::headers::insert_parsed_headers;
 use super::load_config_file;
@@ -102,7 +101,6 @@ struct ProviderDoctor<'a> {
 /// routing, then the provider entry, then the built-in/catalog default.
 fn base_url_source(
     flag_base_url: Option<&str>,
-    file_base_url: Option<&str>,
     live: Option<&LlmConfig>,
     landing: Option<&str>,
     base_url: &str,
@@ -111,8 +109,6 @@ fn base_url_source(
 ) -> String {
     if flag_base_url.is_some() {
         "--base-url (pins endpoint)".to_string()
-    } else if file_base_url.is_some() {
-        "config base_url: (deprecated)".to_string()
     } else if live.is_some() && landing != Some(base_url) {
         match live.and_then(|c| {
             c.endpoints
@@ -192,7 +188,6 @@ fn api_key_source(provider: &Provider, entry: Option<&ProviderEntry>) -> String 
 /// the post-split remainder first, then the stripped model.
 fn protocol_source(
     entry: Option<&ProviderEntry>,
-    file: &Option<serde_yaml::Value>,
     model_api: Option<ApiProtocol>,
     base_url: &str,
     model: &str,
@@ -200,13 +195,6 @@ fn protocol_source(
 ) -> (String, &'static str) {
     if let Some(api) = entry.and_then(|e| e.api) {
         (api.name().to_string(), "config providers.<name>.api")
-    } else if let Some(name) = load_config_str(file, "api") {
-        (
-            ApiProtocol::parse(&name)
-                .map(|a| a.name().to_string())
-                .unwrap_or_else(|| format!("INVALID '{name}'")),
-            "config api: (deprecated)",
-        )
     } else if let Some(api) = model_api {
         (api.name().to_string(), "DEX_MODEL_APIS")
     } else if let Some(api) = crate::llm::learned::lookup(base_url, model) {
@@ -317,17 +305,14 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
 
     let resolved = resolve_provider(&provider, d.provider_entries);
     let entry = d.provider_entries.get(provider.name());
-    let file_base_url = load_config_str(d.file, "base_url");
     let derived_base = d
         .flag_base_url
         .map(str::to_string)
-        .or(file_base_url.clone())
         .or(resolved.landing.clone())
         .unwrap_or_default();
     let base_url = live.map(|c| c.base_url.clone()).unwrap_or(derived_base);
     let base_source = base_url_source(
         d.flag_base_url,
-        file_base_url.as_deref(),
         live,
         resolved.landing.as_deref(),
         &base_url,
@@ -343,8 +328,7 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
     // Wire protocol and its origin. Lookup keys mirror `from_env`: the
     // post-split remainder first, then the stripped model.
     let model_api = model_api_from_env(d.pre_model, &model);
-    let (chain_api, api_source) =
-        protocol_source(entry, d.file, model_api, &base_url, &model, &provider);
+    let (chain_api, api_source) = protocol_source(entry, model_api, &base_url, &model, &provider);
     let api = live.map(|c| c.api.name().to_string()).unwrap_or(chain_api);
     row(out, "protocol", &api, api_source);
     let (chain_ctx, ctx_source) = context_source(d.file, &model);
@@ -589,8 +573,6 @@ fn shared_rows(
     // Headers: count per layer, sources joined.
     let mut header_count = 0;
     let mut header_sources: Vec<&str> = Vec::new();
-    let http_headers = config_headers_map(d.file, "http_headers");
-    let file_headers = config_headers_map(d.file, "headers");
     let entry_headers = entry.map(|e| e.headers.clone()).unwrap_or_default();
     let env_headers = custom_headers_from_env();
     let mut cli_headers = BTreeMap::new();
@@ -598,8 +580,6 @@ fn shared_rows(
         insert_parsed_headers(&mut cli_headers, raw);
     }
     for (headers, source) in [
-        (&http_headers, "config http_headers: (deprecated)"),
-        (&file_headers, "config headers: (deprecated)"),
         (&entry_headers, "config providers.<name>.headers"),
         (&env_headers, "DEX_HEADERS"),
         (&cli_headers, "--header"),

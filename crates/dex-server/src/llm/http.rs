@@ -76,11 +76,10 @@ pub(crate) use dex_ai::transport::{
 };
 
 pub(crate) fn merged_headers(
-    global: &BTreeMap<String, String>,
     scoped: &BTreeMap<String, String>,
     extra: &BTreeMap<String, String>,
 ) -> Vec<(reqwest::header::HeaderName, reqwest::header::HeaderValue)> {
-    merge_header_layers(global, scoped, extra)
+    merge_header_layers(scoped, extra)
         .iter()
         .filter(|(name, _)| !name.eq_ignore_ascii_case("authorization"))
         .filter_map(|(name, value)| {
