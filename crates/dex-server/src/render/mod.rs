@@ -7,7 +7,6 @@
 // only the TUI consumes from it — is compiled out via `#[cfg]`, so the
 // headless build never links ratatui. Dead-code warnings for TUI-only items
 // are therefore expected in that configuration and silenced in bulk here.
-#![cfg_attr(not(feature = "tui"), allow(dead_code))]
 
 pub mod format;
 pub mod theme;
