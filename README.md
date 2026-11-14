@@ -32,8 +32,8 @@ reused to build your own agent.
   `SKILL.md` frontmatter; inject into the system prompt or load on demand via
   `/skill:<name>`. See [Sessions and skills](docs/sessions-and-skills.md).
 - **History compaction** — when the context window fills, older turns are
-  summarized deterministically (no LLM call). `DEX_COMPACTION=llm` or `=jev`
-  switch strategies — see [Environment variables](docs/environment.md).
+  summarized deterministically (no LLM call). `DEX_COMPACTION=llm`
+  switches to an LLM summary — see [Environment variables](docs/environment.md).
 - **Modular by design** — providers, the agent engine, sessions, protocol, and
   server live in separate crates; see [Architecture](docs/architecture.md) and
   [Runtime composability](docs/runtime.md).

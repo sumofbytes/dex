@@ -60,7 +60,7 @@ All of this lives in `crates/dex-server/src/llm/config/` — don't add a second 
 - Keep `crates/dex-server/src/llm/prompt.rs` minimal; tool behavior belongs in `crates/dex-server/src/llm/tool_descriptions.rs`, not the prompt. Schema surface is guarded by `schema_surface_matches_docs` (`src/app.rs`) — git/chain stay dropped, delegate stays one tool with `action: spawn|wait|stop|list|send`.
 - Skills: directory with `SKILL.md` frontmatter (`name`, `description`). Discovered via `skill_dirs()` (`crates/dex-skills/src/discovery.rs`) — cwd `.dex/skills`, `.agents/skills`, then `$XDG_CONFIG_HOME/dex/skills`. Sorted, first `name` wins, duplicates warned.
 - Permissions default `trusted` (`read-only`/`ask`/`trusted`); `bash` is mutating. Native schema: `read`/`bash`/`write`/`edit`/`grep`/`find`/`ls`/`ask_user` plus `delegate` (sub-agents, one tool with `action: spawn|wait|stop|list|send`) and `task` (background shell tasks) — daemon sessions only.
-- Compaction is deterministic by default (`DEX_COMPACTION=llm` for LLM, `=jev` for verbatim tool-output pruning). Keep `tokens > contextWindow - reserveTokens` logic intact.
+- Compaction is deterministic by default (`DEX_COMPACTION=llm` for LLM). Keep `tokens > contextWindow - reserveTokens` logic intact.
 
 ## Release
 

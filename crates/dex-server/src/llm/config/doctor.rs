@@ -365,7 +365,7 @@ fn provider_section(out: &mut String, d: &ProviderDoctor<'_>) {
 }
 
 /// Rows that answer "why is dex doing X?" regardless of which provider (if
-/// any) resolved: compaction, jev, thinking effort, permission, agent wake,
+/// any) resolved: compaction, thinking effort, permission, agent wake,
 /// the header layers, the named endpoints, and the configured `providers:`
 /// list.
 /// Printed even when no provider resolves — those rows are provider-
@@ -379,10 +379,11 @@ fn shared_rows(
     model: &str,
     endpoints: Option<&BTreeMap<String, String>>,
 ) {
-    // Threshold-compaction mode: value and origin owned by the Jev module
-    // next to its parse, so the row cannot drift from runtime behavior.
-    // Printed unconditionally.
-    let (compaction, compaction_source) = crate::agent::compaction::verbatim::compaction_doctor();
+    // Threshold-compaction mode: value and origin owned by the summary-mode
+    // module next to its parse, so the row cannot drift from runtime
+    // behavior. Printed unconditionally.
+    let (compaction, compaction_source) =
+        crate::agent::compaction::summary_mode::compaction_doctor();
     row(out, "compaction", &compaction, &compaction_source);
 
     // Runtime-harness numerics: env > `harness:` file table > built-in
@@ -493,33 +494,6 @@ fn shared_rows(
             "built-in default"
         },
     );
-
-    // Live Jev scorer: key comes only from the environment; the config
-    // `jev:` table is the opt-in. Print the key masked, like `api key`.
-    let jev_row = match (
-        env::var(crate::agent::compaction::verbatim::JEV_KEY_ENV)
-            .ok()
-            .filter(|k| !k.trim().is_empty()),
-        crate::agent::compaction::verbatim::live_credentials(),
-    ) {
-        (_, Some((url, _))) => {
-            let value = if compaction.contains("jev") {
-                "live jev scorer".to_string()
-            } else {
-                "live jev scorer (inactive — compaction not =jev)".to_string()
-            };
-            (value, url)
-        }
-        (Some(_), None) => (
-            "heuristic scorer".to_string(),
-            "TYPESAFE_API_KEY set — add a config 'jev:' table to opt in".to_string(),
-        ),
-        (None, None) => (
-            "heuristic scorer".to_string(),
-            "no TYPESAFE_API_KEY".to_string(),
-        ),
-    };
-    row(out, "jev scorer", &jev_row.0, &jev_row.1);
 
     let (chain_effort, effort_source) = thinking_source(d.file, base_url, model);
     let effort = live

@@ -10,7 +10,7 @@ use super::apply_queue_msg;
 use dex_agent_core::{lane_deps, BARRIER_LANE};
 
 use crate::agent::compaction::compact_history;
-use crate::agent::compaction::verbatim::summary_mode;
+use crate::agent::compaction::summary_mode::summary_mode;
 use crate::agent::composable::{DexHarness, ToolExecutor};
 use crate::agent::state::{wait_cancelled, CancellationSource, ToolState};
 use crate::agent::tokens::TokenLedger;
@@ -281,20 +281,9 @@ pub(super) async fn emergency_compact(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let mut compacted_any = false;
     for _ in 0..harness.recovery_attempts() {
-        // Emergency cuts follow the threshold knob (`DEX_COMPACTION`):
-        // one parse selects both the prune and the fallback summarizer.
+        // Emergency cuts follow the threshold knob (`DEX_COMPACTION`).
         let summarizer = summary_mode();
-        match compact_history(
-            config,
-            messages,
-            cancel,
-            true,
-            summarizer.prunes_jev(),
-            summarizer,
-            harness,
-        )
-        .await
-        {
+        match compact_history(config, messages, cancel, true, summarizer, harness).await {
             Ok((true, usage)) => {
                 compacted_any = true;
                 if let Some(u) = usage {
