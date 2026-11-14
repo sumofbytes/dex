@@ -6,7 +6,7 @@ use tokio::task::JoinHandle;
 use super::tool_results::prepare_tool_result;
 use super::tools::{emergency_compact, inject_steering, note_sink, run_tool_batch};
 use crate::agent::compaction::compact_history;
-use crate::agent::compaction::verbatim::summary_mode;
+use crate::agent::compaction::summary_mode::summary_mode;
 use crate::agent::composable::DexHarness;
 use crate::agent::state::{CancellationSource, ToolState};
 use crate::agent::tokens::{estimate_ephemeral_tokens, schema_budget_tokens, TokenLedger};
@@ -83,20 +83,9 @@ async fn compaction_gate(
         }) {
             break;
         }
-        // Threshold cuts follow the threshold knob (`DEX_COMPACTION`):
-        // one parse selects both the prune and the fallback summarizer.
+        // Threshold cuts follow the threshold knob (`DEX_COMPACTION`).
         let summarizer = summary_mode();
-        match compact_history(
-            config,
-            messages,
-            cancel,
-            false,
-            summarizer.prunes_jev(),
-            summarizer,
-            harness,
-        )
-        .await
-        {
+        match compact_history(config, messages, cancel, false, summarizer, harness).await {
             Ok((true, compacted)) => {
                 compaction_attempts += 1;
                 // History was rewritten: re-measure once for the next attempt.

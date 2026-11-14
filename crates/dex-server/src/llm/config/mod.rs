@@ -331,7 +331,6 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "harness",
     "harness_profile",
     "harness_profiles",
-    "jev",
     // Deprecated but still honored for old files:
     "base_url",
     "api",
