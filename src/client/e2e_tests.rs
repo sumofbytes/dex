@@ -81,7 +81,7 @@ fn client_end_to_end_hits_every_endpoint() {
         .unwrap();
     std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
     std::env::set_var("OPENCODE_API_KEY", "test-key");
-    std::env::set_var("DEX_PERMISSION", "ask-writes");
+    std::env::set_var("DEX_PERMISSION", "ask");
     std::env::set_var("DEX_VERIFY", "false");
     for v in [
         "DEX_MODELS",

@@ -2134,7 +2134,7 @@ mod e2e_tests {
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
-        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_PERMISSION", "ask");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_VERIFY", "true");
         // Clear the rest for hermeticity.
@@ -2181,9 +2181,9 @@ mod e2e_tests {
         .unwrap();
         chat_result.unwrap();
 
-        // ask-writes is enforced at dispatch: exactly one prompt for the
+        // ask is enforced at dispatch: exactly one prompt for the
         // write (previously nothing ever sent on the approval channel, so
-        // the write ran unprompted despite DEX_PERMISSION=ask-writes).
+        // the write ran unprompted despite DEX_PERMISSION=ask).
         let approvals: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
@@ -2478,7 +2478,7 @@ mod e2e_tests {
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
-        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_PERMISSION", "ask");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_VERIFY", "true");
         for v in [
@@ -2828,7 +2828,7 @@ mod e2e_tests {
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
-        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_PERMISSION", "ask");
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_VERIFY", "true");
         for v in [
@@ -3077,7 +3077,7 @@ mod e2e_tests {
         std::fs::write(data_dir.join("config.yaml"), "api: openai-completions\n").unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
-        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_PERMISSION", "ask");
         std::env::set_var("DEX_DAEMON_TOKEN", "s3cret-token");
         for v in [
             "DEX_MODELS",
@@ -3138,8 +3138,7 @@ mod e2e_tests {
         // Nothing selects a provider (the file carries no `model:`), so the
         // best-effort info keeps the empty default instead of guessing one.
         assert_eq!(info["provider"], "");
-        // `ask-writes` is the deprecated spelling of `ask`; `as_str` never
-        // emits it, so `/api/config` reports the canonical value.
+        // `/api/config` reports the canonical spelling.
         assert_eq!(info["permission"], "ask");
         assert_eq!(
             info["cwd"],
@@ -3226,7 +3225,7 @@ mod e2e_tests {
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
-        std::env::set_var("DEX_PERMISSION", "ask-writes");
+        std::env::set_var("DEX_PERMISSION", "ask");
         std::env::set_var("DEX_VERIFY", "false");
         for v in [
             "DEX_MODELS",

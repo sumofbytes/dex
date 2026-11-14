@@ -768,7 +768,6 @@ mod tests;
 mod mcp;
 
 // `/mcp` sheet (TUI) is the only runtime consumer.
-#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use mcp::render_mcp_panel;
 
 mod approval;
@@ -782,5 +781,4 @@ pub use approval::{
 };
 #[cfg(not(feature = "tui"))]
 // `input_has_then_run` only feeds the TUI approval title/risk helpers.
-#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use approval::{approval_details, approval_summary, approval_title, input_has_then_run};

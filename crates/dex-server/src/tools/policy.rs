@@ -35,7 +35,7 @@ pub fn metadata_native(name: &str) -> Option<ToolMetadata> {
         // Extension tools are untrusted third-party code in a sandbox:
         // most restrictive gate (`ask` unless trusted), same as shell/MCP.
         // Resolved dynamically so loaded extensions don't need a static
-        // entry each (`lua__` is the deprecated alias for `ext__`).
+        // entry each.
         _ if crate::extensions::is_extension_tool(name) => shell_row(),
         // MCP tools are external processes: most restrictive gate (`ask`
         // unless trusted), same as shell. Resolved dynamically so cached

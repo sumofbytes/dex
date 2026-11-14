@@ -77,19 +77,16 @@ fn split_names() {
     assert!(split_ext_name("ext__a").is_none());
     assert!(split_ext_name("ext____t").is_none());
     assert!(split_ext_name("ext__a__b__c").is_none());
-    // Deprecated pre-rename alias still dispatches.
-    assert_eq!(split_ext_name("lua__myext__tool"), Some(("myext", "tool")));
-    assert!(split_ext_name("lua__a__b__c").is_none());
+    // The pre-rename `lua__` alias is gone.
+    assert!(split_ext_name("lua__myext__tool").is_none());
 }
 
 #[test]
-fn legacy_alias_names() {
+fn extension_tool_names() {
     assert!(is_extension_tool("ext__web__search"));
-    assert!(is_extension_tool("lua__web__search"));
+    assert!(!is_extension_tool("lua__web__search"));
     assert!(!is_extension_tool("mcp__srv__tool"));
     assert!(!is_extension_tool("read"));
-    assert_eq!(normalize_tool_name("lua__web__search"), "ext__web__search");
-    assert_eq!(normalize_tool_name("ext__web__search"), "ext__web__search");
 }
 
 #[test]
@@ -121,11 +118,6 @@ fn active_names_resolve() {
     assert_eq!(resolve_active_name("web", "search"), "ext__web__search");
     assert_eq!(
         resolve_active_name("web", "ext__web__search"),
-        "ext__web__search"
-    );
-    // Legacy alias normalizes so the read-time filter still matches.
-    assert_eq!(
-        resolve_active_name("web", "lua__web__search"),
         "ext__web__search"
     );
 }

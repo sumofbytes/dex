@@ -56,38 +56,14 @@ pub(crate) fn full_tool_name(ext: &str, tool: &str) -> String {
     format!("ext__{ext}__{tool}")
 }
 
-/// True for extension tools under either the canonical `ext__` prefix or
-/// the pre-rename `lua__` alias (single place that knows both, so dispatch,
-/// gates, and preload stay in sync).
+/// True for extension tools (`ext__` prefix).
 pub fn is_extension_tool(name: &str) -> bool {
-    name.starts_with("ext__") || name.starts_with("lua__")
-}
-
-/// Map a legacy `lua__<ext>__<tool>` name to its canonical `ext__` form.
-/// Canonical names (and non-extension names) pass through untouched.
-pub fn normalize_tool_name(name: &str) -> String {
-    match split_ext_name(name) {
-        Some((ext, tool)) => full_tool_name(ext, tool),
-        None => name.to_string(),
-    }
+    name.starts_with("ext__")
 }
 
 /// Split `ext__<ext>__<tool>`; `None` for anything else (built-ins, MCP).
-/// The pre-rename `lua__` prefix still splits (deprecated alias) with a
-/// one-time pointer at the replacement, so old sessions and one-liners keep
-/// dispatching instead of hitting `unknown tool`.
 pub fn split_ext_name(name: &str) -> Option<(&str, &str)> {
-    let rest = match name.strip_prefix("ext__") {
-        Some(rest) => rest,
-        None => {
-            let rest = name.strip_prefix("lua__")?;
-            crate::runtime::notice::warn_once(
-                "ext.lua-prefix",
-                "tool prefix `lua__` is deprecated, use `ext__` instead",
-            );
-            rest
-        }
-    };
+    let rest = name.strip_prefix("ext__")?;
     let (ext, tool) = rest.split_once("__")?;
     if ext.is_empty() || tool.is_empty() || tool.contains("__") {
         return None;

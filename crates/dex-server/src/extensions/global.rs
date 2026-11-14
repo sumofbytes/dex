@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::llm::config::ExtensionModelSnapshot;
 use crate::protocol::ToolDefinition;
 
-use super::appendix::{full_tool_name, normalize_tool_name};
+use super::appendix::full_tool_name;
 use super::manager::ExtensionManager;
 use super::{AfterOutcome, BeforeOutcome, CallKind, CompactAction, HostCtx, HOOK_TIMEOUT_SECS};
 use super::{MAX_NET_RESPONSE_BYTES, MAX_NET_TIMEOUT_MS};
@@ -997,14 +997,10 @@ pub async fn set_active_global(ext: &str, tools: Vec<String>) {
 }
 
 /// Resolve one `set_active` entry to its full name: already-full `ext__`
-/// names pass through, legacy `lua__` names normalize to `ext__` (so the
-/// read-time filter against canonical cache names still matches), and
-/// anything else names the caller's own tool.
+/// names pass through and anything else names the caller's own tool.
 pub fn resolve_active_name(ext: &str, name: &str) -> String {
     if name.starts_with("ext__") {
         name.to_string()
-    } else if name.starts_with("lua__") {
-        normalize_tool_name(name)
     } else {
         full_tool_name(ext, name)
     }

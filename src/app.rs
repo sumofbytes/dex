@@ -451,8 +451,7 @@ fn run_or_exit(result: Option<Result<String, String>>, usage: &str, fail_prefix:
 /// `dex run <tool>`: extension tools resolve from the manager cache —
 /// lazy-load just the addressed extension (§26) so `dex run ext__...` boots
 /// one Lua VM instead of every installed one (MCP tools have the same race;
-/// out of scope here). The deprecated `lua__` alias preloads too, so old
-/// one-liners keep working. A name that doesn't split keeps the old full
+/// out of scope here). A name that doesn't split keeps the old full
 /// refresh so the dispatch error below stays the authority on what exists.
 fn run_run_tool(name: &str, raw_args: &[String]) {
     let parsed = match crate::cli::parse_tool_args(raw_args) {
@@ -463,8 +462,7 @@ fn run_run_tool(name: &str, raw_args: &[String]) {
         }
     };
     if crate::extensions::is_extension_tool(name) {
-        let normalized = crate::extensions::normalize_tool_name(name);
-        match crate::extensions::split_ext_name(&normalized) {
+        match crate::extensions::split_ext_name(name) {
             Some((ext, _)) => {
                 if let Err(e) = crate::runtime::http::block_on(
                     crate::extensions::global_manager().ensure_loaded(ext),

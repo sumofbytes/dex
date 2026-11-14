@@ -31,7 +31,6 @@ pub(crate) use config::{MCP_DESC_LIMIT, MCP_TOOL_NAME_LIMIT};
 #[cfg(test)]
 pub(crate) use global::status_line;
 // `cached_statuses` feeds the `/mcp` panel (TUI) only.
-#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use global::{
     cached_schema_tokens, cached_statuses, cached_tools, cached_truncated, call_global,
     ephemeral_line, global_manager,

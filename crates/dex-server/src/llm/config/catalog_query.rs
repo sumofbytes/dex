@@ -166,7 +166,6 @@ pub fn reasoning_options_for(model: &str) -> Option<Vec<String>> {
 /// catalog's own casing on match, the raw pick for unknown models (a stale
 /// catalog shouldn't block), or the valid options when rejected.
 // `/thinking` (TUI) is the only runtime caller; tests exercise it directly.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub fn validate_thinking_effort(model: &str, pick: &str) -> Result<String, Vec<String>> {
     match reasoning_options_for(model) {
         Some(options) => options
