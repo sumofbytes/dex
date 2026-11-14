@@ -310,15 +310,11 @@ pub fn harvest_routing_headers(layers: &[&BTreeMap<String, String>]) -> BTreeMap
     out
 }
 
-/// The three header layers of a resolved config, in wire precedence.
+/// The header layers of a resolved config, in wire precedence.
 pub fn config_header_layers(
     config: &crate::llm::config::LlmConfig,
-) -> [&BTreeMap<String, String>; 3] {
-    [
-        &config.global_headers,
-        &config.provider_headers,
-        &config.extra_headers,
-    ]
+) -> [&BTreeMap<String, String>; 2] {
+    [&config.provider_headers, &config.extra_headers]
 }
 
 /// Merge the recorded routing headers under Lua-explicit ones

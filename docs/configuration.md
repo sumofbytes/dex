@@ -118,11 +118,13 @@ Legacy spellings map to their canonical replacement and log a one-time warning
 with a pointer at it. The provider id always lives in `model:` as
 `provider/model` — never in a separate key.
 
+The top-level `base_url:`, `api:`, `headers:` and `http_headers:` keys have been
+removed: a config that still carries one fails to load with an error naming the
+replacement (silently ignoring them would misroute requests or drop headers).
+Move them under the provider's entry in `providers:`.
+
 | Legacy key                                        | Canonical replacement                                                             |
 | ------------------------------------------------- | --------------------------------------------------------------------------------- |
-| top-level `base_url:`                             | `base_url:` under the provider's entry in `providers:`                            |
-| top-level `api:`                                  | `api:` under the provider's entry in `providers:`                                 |
-| top-level `headers:` / `http_headers:`            | `headers:` under the provider's entry (provider-scoped) or `DEX_HEADERS` (global) |
 | `OPENAI_HEADERS` / `ANTHROPIC_CUSTOM_HEADERS` env | `DEX_HEADERS` (same syntax)                                                       |
 | `active_provider:` / `provider:`                  | provider id in `model:` (`provider/model`)                                        |
 

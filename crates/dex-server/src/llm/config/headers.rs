@@ -114,18 +114,17 @@ pub fn insert_extra_header(out: &mut BTreeMap<String, String>, name: &str, value
     out.insert(name.to_string(), value.to_string());
 }
 
-/// One merge for the AGENTS.md header precedence (global file `headers:` <
-/// provider-scoped file `headers:` < env/CLI extras, per key): later layers
+/// One merge for the AGENTS.md header precedence (provider-scoped file
+/// `headers:` < env/CLI extras, per key): later layers
 /// overwrite earlier ones, `authorization` never survives (the api key owns
 /// it). Shared by the wire merge (`llm::http::merged_headers`) and the
 /// extension auth view (`extension_model_auth_for`) so the two can never
 /// drift apart by re-implementing the same order.
 pub fn merge_header_layers(
-    global: &BTreeMap<String, String>,
     scoped: &BTreeMap<String, String>,
     extra: &BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
-    let mut out = global.clone();
+    let mut out = BTreeMap::new();
     for (name, value) in scoped {
         insert_extra_header(&mut out, name, value);
     }
@@ -157,16 +156,15 @@ pub fn apply_opencode_session_headers(config: &mut LlmConfig, session_id: &str) 
     if !is_opencode {
         return;
     }
-    // A name pinned in ANY layer — file (`global_headers`/`provider_headers`)
+    // A name pinned in ANY layer — file (`provider_headers`)
     // or env/CLI/per-request (`extra_headers`) — suppresses the auto-fill:
     // the function writes into `extra_headers`, which merges last, so a
     // file-level user header would otherwise lose to it. Resolve both
     // predicates before mutating (they borrow `config` immutably).
     let taken = |name: &str| {
         config
-            .global_headers
+            .provider_headers
             .keys()
-            .chain(config.provider_headers.keys())
             .chain(config.extra_headers.keys())
             .any(|k| k.eq_ignore_ascii_case(name))
     };
@@ -226,34 +224,6 @@ pub fn config_headers_map(file: &Option<serde_yaml::Value>, key: &str) -> BTreeM
         }
     } else {
         merge_one(&mut out, value);
-    }
-    out
-}
-
-/// Custom headers from the config file. `headers:` wins per-key over
-/// `http_headers:` when both set the same name. Both keys are
-/// deprecated top-level mirrors of provider state — still global, with a
-/// one-time pointer at the canonical spots.
-pub fn load_config_headers(file: &Option<serde_yaml::Value>) -> BTreeMap<String, String> {
-    let mut out = config_headers_map(file, "http_headers");
-    let file_headers = config_headers_map(file, "headers");
-    if out.is_empty() && file_headers.is_empty() {
-        return out;
-    }
-    if !out.is_empty() {
-        warn_once(
-            "config:http_headers",
-            "top-level config key 'http_headers:' is deprecated — use 'headers:' under the provider's entry in 'providers:' (provider-scoped) or DEX_HEADERS (global)",
-        );
-    }
-    if !file_headers.is_empty() {
-        warn_once(
-            "config:headers",
-            "top-level config key 'headers:' is deprecated — use 'headers:' under the provider's entry in 'providers:' (provider-scoped) or DEX_HEADERS (global)",
-        );
-    }
-    for (k, v) in file_headers {
-        insert_extra_header(&mut out, &k, &v);
     }
     out
 }

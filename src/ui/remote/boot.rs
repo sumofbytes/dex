@@ -76,7 +76,6 @@ fn display_config(info: &DaemonInfo) -> crate::llm::config::LlmConfig {
             .unwrap_or(PermissionMode::Ask),
         verify_command: None,
         extra_headers: Default::default(),
-        global_headers: Default::default(),
         provider_entries: Default::default(),
         provider_headers: Default::default(),
         api_pinned: false,

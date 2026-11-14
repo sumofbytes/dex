@@ -4,10 +4,8 @@ use super::base_protocol;
 use super::context_index::catalog_endpoint_for_model;
 use super::headers::custom_headers_from_env;
 use super::headers::insert_parsed_headers;
-use super::headers::load_config_headers;
 use super::headers::merge_header_layers;
 use super::load_config_file;
-use super::load_config_str;
 use super::provider::cli_overrides;
 use super::provider::known_providers;
 use super::provider::load_provider_entries;
@@ -93,12 +91,10 @@ fn extension_model_parts() -> Result<ExtensionModelParts, String> {
             )
         })?;
     let resolved = resolve_provider(&provider, &entries);
-    let file_base_url = load_config_str(&file, "base_url");
     let explicit = cli_base_url
         .as_deref()
         .filter(|u| !u.trim().is_empty())
-        .map(str::to_string)
-        .or(file_base_url);
+        .map(str::to_string);
     let mut base_url = explicit
         .clone()
         .or(resolved.landing.clone())
@@ -128,7 +124,7 @@ fn extension_model_parts() -> Result<ExtensionModelParts, String> {
             model = rest.to_string();
         }
     }
-    let (base_api, _) = base_protocol(&provider, resolved.api_pin, &file);
+    let (base_api, _) = base_protocol(&provider, resolved.api_pin);
     let api = model_api_from_env(&raw_selection, &model)
         .or_else(|| crate::llm::learned::lookup(&base_url, &model))
         .unwrap_or(base_api);
@@ -197,7 +193,7 @@ pub fn extension_provider_auth(provider_name: &str) -> Result<ExtensionProviderA
             )
         })?;
     let auth = extension_model_auth_for(provider_name, &base_url)?;
-    let (api, _) = base_protocol(&provider, resolved.api_pin, &file);
+    let (api, _) = base_protocol(&provider, resolved.api_pin);
     Ok(ExtensionProviderAuth {
         auth,
         api: api.name().to_string(),
@@ -270,7 +266,6 @@ pub fn extension_model_auth_for(
     let (api_key, _) = resolve_credentials(&provider, &entries).map_err(|e| e.to_string())?;
     // Same merge as the wire path — one function, so the Lua view and the
     // request headers can never drift apart.
-    let global = load_config_headers(&file);
     let scoped = entries
         .get(provider.name())
         .map(|entry| entry.headers.clone())
@@ -279,7 +274,7 @@ pub fn extension_model_auth_for(
     for raw in &cli_headers {
         insert_parsed_headers(&mut extra, raw);
     }
-    let headers = merge_header_layers(&global, &scoped, &extra);
+    let headers = merge_header_layers(&scoped, &extra);
     Ok(ExtensionModelAuth {
         api_key,
         base_url: base_url.to_string(),
