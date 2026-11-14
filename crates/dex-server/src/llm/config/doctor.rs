@@ -461,7 +461,7 @@ fn shared_rows(
             "built-in default"
         },
     );
-    // Cut window + prune thresholds: same `from_env`-family reads the turn
+    // Cut window: same `from_env`-family reads the turn
     // loop uses, so the rows cannot drift from runtime behavior.
     let cut_source = if file_has("keep_recent_messages") || file_has("min_to_summarize") {
         "config harness:"
@@ -476,23 +476,6 @@ fn shared_rows(
             hc.cut.min_keep_messages, hc.cut.min_to_summarize
         ),
         cut_source,
-    );
-    let prune = crate::agent::composable::prune_thresholds_from_env();
-    row(
-        out,
-        "harness prune",
-        &format!(
-            "keep <{}/trunc >{}/drop >{} chars",
-            prune.keep_below_chars, prune.truncate_above_chars, prune.drop_above_chars
-        ),
-        if file_has("keep_below_chars")
-            || file_has("truncate_above_chars")
-            || file_has("drop_above_chars")
-        {
-            "config harness:"
-        } else {
-            "built-in default"
-        },
     );
 
     let (chain_effort, effort_source) = thinking_source(d.file, base_url, model);

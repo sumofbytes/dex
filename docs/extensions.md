@@ -75,9 +75,6 @@ harness: # runtime harness numerics (env DEX_MAX_TOOL_ITERATIONS wins for iterat
   min_to_summarize: 8
   recent_window: 6
   repeat_limit: 3
-  keep_below_chars: 500
-  truncate_above_chars: 2000
-  drop_above_chars: 10000
   slots: # named registry impls; `dex runtime graph` prints the resolved graph
     # catalog: native-only # default (native + MCP + extensions) | native-only
     # trigger: never       # default (config budget) | never
