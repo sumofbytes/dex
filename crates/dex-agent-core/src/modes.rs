@@ -14,27 +14,12 @@ impl PermissionMode {
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.to_ascii_lowercase().replace('_', "-").as_str() {
             "read-only" | "readonly" => Ok(Self::ReadOnly),
-            "ask" | "ask-writes" | "ask-write" | "ask-shell" | "ask-commands" => Ok(Self::Ask),
+            "ask" => Ok(Self::Ask),
             "trusted" | "non-interactive" => Ok(Self::Trusted),
             other => Err(format!(
                 "invalid permission mode '{}'; use read-only, ask, or trusted",
                 other
             )),
-        }
-    }
-
-    /// Host warning key and message for accepted legacy spellings.
-    pub fn deprecated_alias(value: &str) -> Option<(&'static str, &'static str)> {
-        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "ask-writes" | "ask-write" => Some((
-                "permission-ask-writes",
-                "permission mode 'ask-writes' is deprecated — use 'ask'; it now also prompts on shell commands",
-            )),
-            "ask-shell" | "ask-commands" => Some((
-                "permission-ask-shell",
-                "permission mode 'ask-shell' is deprecated — use 'ask'; it now also prompts on writes and edits",
-            )),
-            _ => None,
         }
     }
 
@@ -46,7 +31,7 @@ impl PermissionMode {
         }
     }
 
-    /// Canonical wire spelling. Never emits a deprecated alias.
+    /// Canonical wire spelling.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::ReadOnly => "read-only",
@@ -115,5 +100,18 @@ impl AgentMode {
 
     pub fn is_plan(self) -> bool {
         matches!(self, Self::Plan)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn permission_parse_rejects_removed_ask_aliases() {
+        assert_eq!(PermissionMode::parse("ask"), Ok(PermissionMode::Ask));
+        for old in ["ask-writes", "ask-write", "ask-shell", "ask-commands"] {
+            assert!(PermissionMode::parse(old).is_err(), "{old}");
+        }
     }
 }
