@@ -19,7 +19,7 @@ use crate::runtime::console::with_console;
 
 /// Everything one provider HTTP call needs, resolved once from `LlmConfig`
 /// so the retry core below never sees config resolution. This is the seam
-/// that makes the transport generic: another caller (jev, MCP) with its own
+/// that makes the transport generic: another caller (MCP) with its own
 /// `HttpCall` gets the same auth, header-merge, backoff, and 401-refresh
 /// behavior without importing `LlmConfig`.
 #[derive(Clone)]

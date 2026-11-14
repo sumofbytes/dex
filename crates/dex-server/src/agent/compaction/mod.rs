@@ -1,7 +1,7 @@
 use tokio::sync::mpsc;
 
 mod deterministic;
-pub(crate) mod verbatim;
+pub(crate) mod summary_mode;
 
 use deterministic::{attach_file_section, extract_file_ops_from_message};
 pub(crate) use deterministic::{deterministic_summary, FileOps};
@@ -475,15 +475,12 @@ pub(crate) async fn compact_history(
     messages: &mut Vec<ChatMessage>,
     _cancel: &(dyn CancellationSource + Send + Sync),
     emergency: bool,
-    // Whether a worthwhile verbatim prune beats the summary. The threshold
-    // path derives both from `summary_mode()` (`DEX_COMPACTION`).
-    jev_prune: bool,
-    // Fallback summarizer when no hook summary applies and the prune is
-    // skipped or does not pay — always the threshold knob's choice, parsed
-    // once by the caller instead of re-read here.
-    summarizer: crate::agent::compaction::verbatim::SummaryMode,
-    // Overwritable harness decisions: cut window, prune scorer, fallback
-    // summarizer override, and the prune-payoff ratio.
+    // Summarizer used when no hook summary applies — always the threshold
+    // knob's choice (`summary_mode()`), parsed once by the caller instead of
+    // re-read here.
+    summarizer: crate::agent::compaction::summary_mode::SummaryMode,
+    // Overwritable harness decisions: cut window and fallback summarizer
+    // override.
     harness: &crate::agent::composable::DexHarness,
 ) -> Result<(bool, Option<Usage>), String> {
     let total = messages.len();
@@ -591,62 +588,12 @@ pub(crate) async fn compact_history(
         )
         .await);
 
-    // Jev verbatim prune: drop/truncate stale tool outputs in place, no
-    // summary message, no LLM spend. Tried on a clone so an insufficient
-    // prune discards cleanly and the summarizer below still sees the
-    // original span. An explicit `session.before_compact` replacement or a
-    // Lua `harness.summarize` summary always wins. With `TYPESAFE_API_KEY`
-    // + a config `jev:` table, the real Typesafe Jev scorer replaces the
-    // heuristic; any live failure falls back to the heuristic inside
-    // `prune_span`.
-    if hook_summary.is_none() && jev_prune {
-        let creds = crate::agent::compaction::verbatim::live_credentials();
-        let scorer = if creds.is_some() {
-            crate::agent::compaction::verbatim::Scorer::Jev
-        } else {
-            crate::agent::compaction::verbatim::Scorer::Heuristic
-        };
-        let live =
-            creds.as_ref().map(
-                |(endpoint, key)| crate::agent::compaction::verbatim::LiveScorer {
-                    endpoint,
-                    api_key: key,
-                },
-            );
-        let mut candidate = messages.clone();
-        let stats = crate::agent::compaction::verbatim::prune_span(
-            &mut candidate,
-            boundary_start,
-            first_kept,
-            scorer,
-            &*harness.scorer,
-            live.as_ref(),
-        )
-        .await;
-        if crate::agent::compaction::verbatim::meets_reduction(
-            &stats,
-            harness.config.limits.reduction_ratio(),
-        ) {
-            dex_runtime::log!(
-                Info,
-                "jev compaction: dropped {} truncated {} kept {} (freed {} chars, ratio {:.2})",
-                stats.dropped,
-                stats.truncated,
-                stats.kept,
-                stats.freed_chars,
-                crate::agent::compaction::verbatim::reduction_ratio(&stats)
-            );
-            *messages = candidate;
-            return Ok((true, None));
-        }
-    }
-
     // Generate summary — merge two summaries for split turns
     let mut usage_total: Option<Usage> = None;
     let fallback = harness.summarizer.as_deref();
     let summarized = if let Some(summary) = hook_summary.as_deref() {
         summary.to_string()
-    } else if summarizer == crate::agent::compaction::verbatim::SummaryMode::Llm {
+    } else if summarizer == crate::agent::compaction::summary_mode::SummaryMode::Llm {
         llm_summary(
             _config,
             _cancel,
@@ -911,8 +858,7 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            false,
-            crate::agent::compaction::verbatim::summary_mode(),
+            crate::agent::compaction::summary_mode::summary_mode(),
             &crate::agent::composable::DexHarness::default(),
         )
         .await
@@ -1007,8 +953,7 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            false,
-            crate::agent::compaction::verbatim::summary_mode(),
+            crate::agent::compaction::summary_mode::summary_mode(),
             &crate::agent::composable::DexHarness::default(),
         )
         .await
@@ -1024,8 +969,7 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            false,
-            crate::agent::compaction::verbatim::summary_mode(),
+            crate::agent::compaction::summary_mode::summary_mode(),
             &crate::agent::composable::DexHarness::default(),
         )
         .await
@@ -1069,8 +1013,7 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            false,
-            crate::agent::compaction::verbatim::summary_mode(),
+            crate::agent::compaction::summary_mode::summary_mode(),
             &crate::agent::composable::DexHarness::default(),
         )
         .await
@@ -1140,8 +1083,7 @@ mod tests {
             &mut messages.clone(),
             &crate::agent::state::GlobalCancellation,
             true,
-            false,
-            crate::agent::compaction::verbatim::summary_mode(),
+            crate::agent::compaction::summary_mode::summary_mode(),
             &crate::agent::composable::DexHarness::default(),
         )
         .await
@@ -1154,8 +1096,7 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            false,
-            crate::agent::compaction::verbatim::summary_mode(),
+            crate::agent::compaction::summary_mode::summary_mode(),
             &crate::agent::composable::DexHarness::default(),
         )
         .await
@@ -1198,8 +1139,7 @@ mod tests {
             &mut messages.clone(),
             &crate::agent::state::GlobalCancellation,
             false,
-            false,
-            crate::agent::compaction::verbatim::summary_mode(),
+            crate::agent::compaction::summary_mode::summary_mode(),
             &crate::agent::composable::DexHarness::default(),
         )
         .await
@@ -1210,8 +1150,7 @@ mod tests {
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             true,
-            false,
-            crate::agent::compaction::verbatim::summary_mode(),
+            crate::agent::compaction::summary_mode::summary_mode(),
             &crate::agent::composable::DexHarness::default(),
         )
         .await
@@ -1227,7 +1166,7 @@ mod tests {
         assert_eq!(messages[1].name.as_deref(), Some("summary"));
     }
 
-    fn jev_call(id: &str) -> LlmToolCall {
+    fn read_call(id: &str) -> LlmToolCall {
         LlmToolCall {
             id: id.into(),
             call_type: "function".into(),
@@ -1239,110 +1178,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // env must stay `=jev` across the compaction await
-    async fn jev_prunes_tool_heavy_history_without_a_summary() {
-        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvRestore::take(&["DEX_COMPACTION"]);
-        std::env::set_var("DEX_COMPACTION", "jev");
-        let config = crate::llm::config::tests::test_cfg();
-        let mut messages = vec![msg(Role::System, "sys")];
-        messages.push(msg(Role::User, "goal: build the thing"));
-        for i in 0..10 {
-            messages.push(ChatMessage::assistant_calls(
-                None,
-                vec![jev_call(&format!("c{i}"))],
-            ));
-            messages.push(ChatMessage::tool_result(
-                format!("c{i}"),
-                "x".repeat(12_000),
-            ));
-        }
-        for i in 0..KEEP_RECENT_MESSAGES {
-            messages.push(msg(Role::User, &format!("recent {i}")));
-        }
-        let before = messages.len();
-        // Mirrors the threshold caller in `loop.rs`: one parse selects
-        // both the prune and the fallback summarizer.
-        let summarizer = crate::agent::compaction::verbatim::summary_mode();
-        let (compacted, usage) = compact_history(
-            &config,
-            &mut messages,
-            &crate::agent::state::GlobalCancellation,
-            false,
-            summarizer.prunes_jev(),
-            summarizer,
-            &crate::agent::composable::DexHarness::default(),
-        )
-        .await
-        .unwrap();
-        assert!(compacted, "jev must prune a tool-heavy span");
-        assert!(usage.is_none(), "pruning spends no summarizer tokens");
-        assert!(
-            !messages
-                .iter()
-                .any(|m| m.name.as_deref() == Some("summary")),
-            "jev leaves no summary message"
-        );
-        // User text survives verbatim; stale pairs are gone.
-        assert!(messages
-            .iter()
-            .any(|m| m.content_str() == "goal: build the thing"));
-        assert!(messages.len() < before, "pruning must shrink history");
-        assert!(
-            !messages
-                .iter()
-                .any(|m| m.tool_call_id.as_deref() == Some("c0")),
-            "oldest dropped pair must be gone with its call"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // env must stay `=jev` across the compaction await
-    async fn jev_falls_back_to_deterministic_when_pruning_does_not_pay() {
-        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvRestore::take(&["DEX_COMPACTION"]);
-        std::env::set_var("DEX_COMPACTION", "jev");
-        let config = crate::llm::config::tests::test_cfg();
-        // Tool-light history the normal path still cuts: nothing to prune,
-        // so the deterministic summary must cover the span instead.
-        let mut messages = vec![msg(Role::System, "sys")];
-        messages.push(msg(Role::User, "goal: build the thing"));
-        for i in 0..20 {
-            messages.push(msg(Role::User, &format!("u{i}: {}", "x".repeat(200))));
-            messages.push(msg(Role::Assistant, &format!("a{i}: {}", "y".repeat(200))));
-        }
-        // Mirrors the threshold caller in `loop.rs`: one parse selects
-        // both the prune and the fallback summarizer.
-        let summarizer = crate::agent::compaction::verbatim::summary_mode();
-        let (compacted, _) = compact_history(
-            &config,
-            &mut messages,
-            &crate::agent::state::GlobalCancellation,
-            false,
-            summarizer.prunes_jev(),
-            summarizer,
-            &crate::agent::composable::DexHarness::default(),
-        )
-        .await
-        .unwrap();
-        assert!(compacted, "fallback summary must run");
-        assert!(
-            messages
-                .iter()
-                .any(|m| m.name.as_deref() == Some("summary")),
-            "insufficient prune must fall back to a summary"
-        );
-    }
-
-    #[tokio::test]
     #[allow(clippy::await_holding_lock)] // env must stay set across the compaction await
     async fn threshold_compaction_summarizes_by_default() {
         // The threshold path follows `DEX_COMPACTION`: unset means the
-        // deterministic summary covers a tool-heavy span (no verbatim prune).
+        // deterministic summary covers a tool-heavy span .
         let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -1354,7 +1193,7 @@ mod tests {
         for i in 0..10 {
             messages.push(ChatMessage::assistant_calls(
                 None,
-                vec![jev_call(&format!("c{i}"))],
+                vec![read_call(&format!("c{i}"))],
             ));
             messages.push(ChatMessage::tool_result(
                 format!("c{i}"),
@@ -1364,15 +1203,13 @@ mod tests {
         for i in 0..KEEP_RECENT_MESSAGES {
             messages.push(msg(Role::User, &format!("recent {i}")));
         }
-        // Mirrors the threshold caller in `loop.rs`: one parse selects
-        // both the prune and the fallback summarizer.
-        let summarizer = crate::agent::compaction::verbatim::summary_mode();
+        // Mirrors the threshold caller in `loop.rs`.
+        let summarizer = crate::agent::compaction::summary_mode::summary_mode();
         let (compacted, _) = compact_history(
             &config,
             &mut messages,
             &crate::agent::state::GlobalCancellation,
             false,
-            summarizer.prunes_jev(),
             summarizer,
             &crate::agent::composable::DexHarness::default(),
         )
@@ -1383,142 +1220,7 @@ mod tests {
             messages
                 .iter()
                 .any(|m| m.name.as_deref() == Some("summary")),
-            "threshold without DEX_COMPACTION=jev must summarize, not prune"
+            "threshold compaction must leave a summary message"
         );
-    }
-
-    /// Live end-to-end: `DEX_COMPACTION=jev` + `TYPESAFE_API_KEY` + a
-    /// config `jev:` table sends the span's pairs to the (mock) systemone
-    /// endpoint and prunes by the noul verdicts — no summary, no LLM
-    /// summarizer usage.
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // env must stay set across the compaction await
-    async fn live_jev_compaction_uses_the_typesafe_api() {
-        use std::sync::{Arc, Mutex};
-
-        let _lock = crate::test_env::TEST_SESSIONS_ENV_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let _env = EnvRestore::take(&["DEX_COMPACTION"]);
-
-        // Mock systemone: `read` pairs (even offsets) → drop everything;
-        // `bash` pairs (odd) → keep call, drop result. The endpoint's
-        // verdicts drive the prune, not the heuristic's tool registry.
-        let log: Arc<Mutex<Vec<serde_json::Value>>> = Arc::new(Mutex::new(Vec::new()));
-        let app_log = log.clone();
-        let handler = move |axum::extract::State(log): axum::extract::State<
-            Arc<Mutex<Vec<serde_json::Value>>>,
-        >,
-                            body: String| async move {
-            let request: serde_json::Value = serde_json::from_str(&body).unwrap();
-            log.lock().unwrap().push(request.clone());
-            let mut answers = serde_json::Map::new();
-            for id in request["questions"].as_object().unwrap().keys() {
-                // Even pairs (read): noul 0 → drop both halves. Odd pairs
-                // (bash): keep the call (1.0), drop the result (0.0).
-                let even_pair = ["p0_", "p2_", "p4_"].iter().any(|p| id.starts_with(p));
-                let noul = if even_pair || id.ends_with("_result_needed_verbatim") {
-                    0.0
-                } else {
-                    1.0
-                };
-                answers.insert(
-                    id.clone(),
-                    serde_json::json!({"type": "noul", "noul": noul}),
-                );
-            }
-            axum::Json(serde_json::json!({"model": "jev-test", "answers": answers}))
-        };
-        let app = axum::Router::new()
-            .route("/v1/systemone", axum::routing::post(handler))
-            .with_state(app_log);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let endpoint = format!("http://{addr}/v1/systemone");
-
-        // Config file with the `jev:` table + key env: the opt-in gate.
-        let dir = std::env::temp_dir().join("dex-jev-e2e-test");
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let cfg_path = dir.join("config.yaml");
-        std::fs::write(&cfg_path, format!("jev:\n  url: {endpoint}\n")).unwrap();
-        crate::llm::config::invalidate_config_cache();
-        let _cfg_env = EnvRestore::take(&["DEX_CONFIG"]);
-        std::env::set_var("DEX_CONFIG", &cfg_path);
-        let _key_env = EnvRestore::take(&["TYPESAFE_API_KEY"]);
-        std::env::set_var("TYPESAFE_API_KEY", "sk-test");
-
-        std::env::set_var("DEX_COMPACTION", "jev");
-        let config = crate::llm::config::tests::test_cfg();
-        let mut messages = vec![msg(Role::System, "sys")];
-        messages.push(msg(Role::User, "goal: build the thing"));
-        for i in 0..6 {
-            let tool = if i % 2 == 0 { "read" } else { "bash" };
-            messages.push(ChatMessage::assistant_calls(
-                None,
-                vec![LlmToolCall {
-                    id: format!("c{i}"),
-                    call_type: "function".into(),
-                    function: FunctionCall {
-                        name: tool.into(),
-                        arguments: format!("{{\"path\":\"f{i}.rs\"}}"),
-                    },
-                }],
-            ));
-            messages.push(ChatMessage::tool_result(
-                format!("c{i}"),
-                "x".repeat(12_000),
-            ));
-        }
-        for i in 0..KEEP_RECENT_MESSAGES {
-            messages.push(msg(Role::User, &format!("recent {i}")));
-        }
-        let summarizer = crate::agent::compaction::verbatim::summary_mode();
-        let (compacted, usage) = compact_history(
-            &config,
-            &mut messages,
-            &crate::agent::state::GlobalCancellation,
-            false,
-            summarizer.prunes_jev(),
-            summarizer,
-            &crate::agent::composable::DexHarness::default(),
-        )
-        .await
-        .unwrap();
-        assert!(compacted, "live jev must prune a tool-heavy span");
-        assert!(usage.is_none(), "pruning spends no summarizer tokens");
-        assert!(!messages
-            .iter()
-            .any(|m| m.name.as_deref() == Some("summary")));
-
-        // The endpoint saw the span's pairs: 6 result questions per request.
-        let log = log.lock().unwrap();
-        assert!(!log.is_empty(), "the mock endpoint must have been called");
-        let questions = log[0]["questions"].as_object().unwrap();
-        assert!(questions
-            .keys()
-            .any(|k| k.ends_with("_result_needed_verbatim")));
-        assert_eq!(
-            log[0]["model"],
-            crate::agent::compaction::verbatim::JEV_MODEL
-        );
-        drop(log);
-
-        // Endpoint verdicts applied: even (read) pairs dropped entirely,
-        // odd (bash) results truncated, recent users untouched.
-        assert!(!messages.iter().any(|m| m
-            .tool_call_id
-            .as_deref()
-            .is_some_and(|id| id == "c0" || id == "c2")));
-        assert!(messages
-            .iter()
-            .any(|m| m.tool_call_id.as_deref() == Some("c1")
-                && m.content_str().contains("jev: truncated")));
-        assert!(messages
-            .iter()
-            .any(|m| m.content_str() == "goal: build the thing"));
-
-        crate::llm::config::invalidate_config_cache();
     }
 }

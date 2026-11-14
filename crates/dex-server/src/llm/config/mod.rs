@@ -336,7 +336,6 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "harness",
     "harness_profile",
     "harness_profiles",
-    "jev",
 ];
 
 /// Top-level keys that were removed in favor of `providers.<name>.*`. Unlike
