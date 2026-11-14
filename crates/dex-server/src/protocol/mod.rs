@@ -9,11 +9,7 @@ pub use dex_ai::{
 pub use dex_protocol::*;
 
 pub fn parse_permission_mode(value: &str) -> Result<PermissionMode, String> {
-    let mode = PermissionMode::parse(value)?;
-    if let Some((key, message)) = PermissionMode::deprecated_alias(value) {
-        crate::runtime::notice::warn_once(key, message);
-    }
-    Ok(mode)
+    PermissionMode::parse(value)
 }
 
 pub mod tokens;

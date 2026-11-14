@@ -146,7 +146,6 @@ pub async fn call_global(
 /// caller renders that as "unavailable" rather than an empty server list,
 /// which would wrongly imply no MCP is configured.
 // `/mcp` panel (TUI) is the only runtime caller.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub fn cached_statuses() -> Option<Vec<ServerStatus>> {
     let mgr = GLOBAL.get()?;
     try_snapshot(mgr)

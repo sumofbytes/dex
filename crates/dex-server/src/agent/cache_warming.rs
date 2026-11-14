@@ -319,10 +319,6 @@ mod tests {
         assert!(!token.is_cancelled());
     }
 
-    // `ApiProtocol` would otherwise be an unused import in non-test builds.
-    #[allow(unused)]
-    fn _api_protocol_marker(_: ApiProtocol) {}
-
     #[test]
     fn warming_mirrors_the_sessions_thinking_parameter() {
         // Plain history, effort off: tiny dead-reply cap, thinking off.

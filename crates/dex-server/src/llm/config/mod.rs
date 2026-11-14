@@ -28,7 +28,6 @@ mod selection;
 /// keep working.
 // `/thinking` (TUI) is the only runtime caller of these two; tests use the
 // `llm::thinking` path directly.
-#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use super::thinking::{remember_thinking_effort, stored_thinking_effort};
 #[cfg(test)]
 pub use crate::workspace::unique_tmp_path;
@@ -40,7 +39,6 @@ pub use secrets::{
     auth_file_path, auth_file_too_open, remove_key, store_key, stored_providers, SecretRef,
 };
 // `/thinking` (TUI) is the only runtime `validate_thinking_effort` caller.
-#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use catalog_query::{
     load_dex_models_cache, reasoning_options_for, refresh_models_cache, refresh_models_cache_async,
     validate_thinking_effort, warn_provider_like_selection,
@@ -54,7 +52,6 @@ pub use context_index::{
 };
 pub use cost::resolve_model_cost;
 pub use cost::usage_cost;
-#[cfg_attr(not(feature = "tui"), allow(unused_imports))]
 pub use cost::{cost_hint_for, model_hints_for};
 pub use doctor::doctor;
 pub use extension_model::{
@@ -1084,7 +1081,6 @@ impl LlmConfig {
     }
 
     // `/provider` (TUI) is the only runtime caller; tests exercise it directly.
-    #[cfg_attr(not(feature = "tui"), allow(dead_code))]
     pub fn switch_provider(
         &mut self,
         provider: &Provider,

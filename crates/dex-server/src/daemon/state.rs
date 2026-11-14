@@ -56,7 +56,6 @@ pub struct PendingQuestion {
 /// A completed chat turn kept for `Idempotency-Key` dedup (P10): replaying
 /// the same key within the window returns the recorded terminal event instead
 /// of running the turn again (no duplicate effects).
-#[allow(dead_code)]
 pub(crate) struct IdempotentTurn {
     pub(crate) session_id: String,
     /// Hash of the request body so a key cannot replay a different prompt.
@@ -386,8 +385,8 @@ impl DaemonState {
     /// orphaned child task survives its session. `shutdown` marks the
     /// manager closed, so stale clones cannot respawn into the dropped
     /// registry. Session delete/reset hook — currently only reached from
-    /// tests until those endpoints exist, hence `dead_code`.
-    #[allow(dead_code)]
+    /// tests until those endpoints exist, hence `cfg(test)`.
+    #[cfg(test)]
     pub(crate) async fn remove_session_agents(&self, session_id: &str) {
         // The children are about to be cancelled: deny their still-parked
         // approvals so a blocked tool call wakes and unwinds instead of
@@ -423,10 +422,10 @@ impl DaemonState {
         }
     }
 
-    #[allow(dead_code)]
     /// Scoped “allow for session” check — mirrors `Console::approval_key`
     /// so daemon and console agree on scope. `write`/`edit` → path, `bash` →
     /// command, else full input hash.
+    #[cfg(test)]
     pub(crate) fn is_session_approved(&self, session_id: &str, name: &str, input: &str) -> bool {
         let key = crate::runtime::console::Console::approval_key(name, input);
         lock_map(&self.session_approvals)

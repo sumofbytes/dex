@@ -2,7 +2,6 @@
 //!
 //! Sync, no tokio, no `DaemonState` — everything property-testable lives
 //! here. The async drain/registry wrappers in `mod.rs` stay thin.
-#![allow(dead_code)] // step 0 scaffolding: async/tool/wake call sites land later
 
 use std::collections::VecDeque;
 
@@ -12,8 +11,6 @@ use dex_agent_core::clamp_lines;
 pub const MAX_RUNNING: usize = 8;
 /// Retained finished tasks per session (drop-oldest).
 pub const MAX_FINISHED_RETAINED: usize = 8;
-/// `wait(timeout_secs)` ceiling, mirrors `delegate` (`schema.rs:21`).
-pub const MAX_WAIT_SECS: u64 = 120;
 /// Bash-class clamp applied to the *new* byte range.
 pub const OUTPUT_CLAMP_LINES: usize = 400;
 pub const OUTPUT_CLAMP_BYTES: usize = 32 * 1024;
@@ -101,12 +98,6 @@ pub fn clamp_new(text: &str) -> String {
     clamp_lines(text, OUTPUT_CLAMP_LINES, OUTPUT_CLAMP_BYTES)
 }
 
-/// Clamp `wait(timeout_secs)` server-side (schema bounds are advisory).
-/// `0` is preserved (poll once).
-pub fn clamp_timeout(secs: u64) -> u64 {
-    secs.min(MAX_WAIT_SECS)
-}
-
 /// Session-scoped id (`task-1`…).
 pub fn next_id(counter: u64) -> String {
     format!("task-{}", counter + 1)
@@ -171,13 +162,6 @@ mod tests {
         assert_eq!(buf.len(), 4);
         assert_eq!(dropped, 1);
         assert_eq!(dropped + buf.len() as u64, total);
-    }
-
-    #[test]
-    fn timeout_clamps() {
-        assert_eq!(clamp_timeout(0), 0);
-        assert_eq!(clamp_timeout(30), 30);
-        assert_eq!(clamp_timeout(999), 120);
     }
 
     #[test]
@@ -300,16 +284,6 @@ mod proptests {
             // Note: no idempotency assert — `clamp_lines` normalizes
             // trailing newlines via `lines().join()`, so blank-line
             // inputs are not fixed points (same as foreground bash).
-        }
-
-        /// P6 timeout clamp.
-        #[test]
-        fn timeout_clamp_holds(secs in any::<u64>()) {
-            let c = clamp_timeout(secs);
-            prop_assert!(c <= MAX_WAIT_SECS);
-            if secs <= MAX_WAIT_SECS {
-                prop_assert_eq!(c, secs);
-            }
         }
     }
 }

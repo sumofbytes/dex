@@ -794,10 +794,7 @@ fn permission_parse_and_ordering() {
         PermissionMode::parse("readonly").unwrap(),
         PermissionMode::ReadOnly
     );
-    assert_eq!(
-        PermissionMode::parse("ask_writes").unwrap(),
-        PermissionMode::Ask
-    );
+    assert_eq!(PermissionMode::parse("ask").unwrap(), PermissionMode::Ask);
     assert_eq!(
         PermissionMode::parse("trusted").unwrap(),
         PermissionMode::Trusted

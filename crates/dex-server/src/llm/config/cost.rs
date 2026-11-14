@@ -38,7 +38,6 @@ pub fn format_cost_label(cost: &CostRates) -> String {
 
 /// One picker row's attribution: who serves the id and at what price.
 /// Resolved in one catalog-index pass (see `model_hints_for`).
-#[cfg_attr(not(any(feature = "tui", test)), allow(dead_code))]
 pub struct ModelHint {
     pub provider: Option<String>,
     pub cost: Option<String>,
@@ -52,7 +51,6 @@ pub struct ModelHint {
 /// `q`'s price); a bare id attributes the cheapest priced entry (`from`
 /// semantics: the row routes at pick time, the cheapest is the floor).
 /// `None` fields when the catalog has no entry for the id.
-#[cfg_attr(not(any(feature = "tui", test)), allow(dead_code))]
 pub fn model_hints_for(selections: &[String]) -> Vec<ModelHint> {
     with_catalog_index(|index| {
         selections
@@ -134,7 +132,6 @@ pub fn model_hints_for(selections: &[String]) -> Vec<ModelHint> {
 
 /// One display cost per picker row (batch wrapper over `model_hints_for`).
 /// `None` when the catalog has no priced entry for the id.
-#[cfg_attr(not(any(feature = "tui", test)), allow(dead_code))]
 pub fn cost_hints_for(selections: &[String]) -> Vec<Option<String>> {
     model_hints_for(selections)
         .into_iter()
@@ -143,7 +140,6 @@ pub fn cost_hints_for(selections: &[String]) -> Vec<Option<String>> {
 }
 
 /// Single-row convenience for `/model` confirmations.
-#[cfg_attr(not(any(feature = "tui", test)), allow(dead_code))]
 pub fn cost_hint_for(selection: &str) -> Option<String> {
     cost_hints_for(std::slice::from_ref(&selection.to_string()))
         .into_iter()

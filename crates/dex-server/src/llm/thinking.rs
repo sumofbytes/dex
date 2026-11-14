@@ -20,7 +20,6 @@ fn thinking_map() -> serde_json::Map<String, serde_json::Value> {
 }
 
 // `/thinking` (TUI) is the only runtime caller; tests exercise it directly.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 fn write_thinking_map(map: &serde_json::Map<String, serde_json::Value>) {
     let Some(path) = thinking_path() else {
         return;
@@ -50,7 +49,6 @@ pub fn stored_thinking_effort(base_url: &str, model: &str) -> Option<String> {
 /// Remember (`Some`) or clear (`None`) the `/thinking` choice for one
 /// endpoint+model. Best-effort.
 // `/thinking` (TUI) is the only runtime caller; tests exercise it directly.
-#[cfg_attr(not(feature = "tui"), allow(dead_code))]
 pub fn remember_thinking_effort(base_url: &str, model: &str, effort: Option<&str>) {
     let mut map = thinking_map();
     let key = format!("{base_url}|{model}");
