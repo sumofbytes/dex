@@ -9,15 +9,13 @@
 //! - [`Summarizer`] — how compacted history is summarized.
 //! - [`OverflowDetector`] — when a model error means "context too big".
 //! - [`ConflictDetector`] — when a tool batch must run serialized.
-//! - [`PruneScorer`] — which compacted tool pairs survive verbatim.
 //! - [`HarnessLimits`] — numeric budgets (tool rounds, compaction attempts,
 //!   batch fan-out) in one struct instead of scattered env reads.
 //! - [`CutConfig`] — cut-point window (keep-recent tokens + message-count
 //!   fallback) replacing scattered `KEEP_RECENT_*` consts.
 //!
 //! Each trait ships with closure adapters (`FnCatalog`, `FnTrigger`,
-//! `FnSummarizer`, `FnOverflowDetector`, `FnConflictDetector`,
-//! `FnPruneScorer`), static test doubles (`StaticCatalog`,
+//! `FnSummarizer`, `FnOverflowDetector`, `FnConflictDetector`), static test doubles (`StaticCatalog`,
 //! `NeverCompact`, `AlwaysCompact`, `StaticSummarizer`, `SerializeAll`,
 //! `NeverConflict`), and a [`Harness`] builder that bundles every piece so
 //! hosts hold one value and delegate their decision points to it.
@@ -236,7 +234,6 @@ pub struct Harness {
     summarizer: Arc<dyn Summarizer>,
     overflow: Arc<dyn OverflowDetector>,
     conflict: Arc<dyn ConflictDetector>,
-    scorer: Arc<dyn PruneScorer>,
     limits: HarnessLimits,
     cut: CutConfig,
     tool_round_limit: usize,
@@ -254,7 +251,6 @@ impl Default for Harness {
             summarizer: Arc::new(DeterministicSummarizer),
             overflow: Arc::new(DefaultOverflowDetector),
             conflict: Arc::new(SerializeAll),
-            scorer: Arc::new(DefaultPruneScorer::default()),
             limits: HarnessLimits::default(),
             cut: CutConfig::default(),
             tool_round_limit: HarnessLimits::default().max_tool_iterations,
@@ -270,7 +266,6 @@ impl Harness {
         summarizer: Arc<dyn Summarizer>,
         overflow: Arc<dyn OverflowDetector>,
         conflict: Arc<dyn ConflictDetector>,
-        scorer: Arc<dyn PruneScorer>,
         limits: HarnessLimits,
         cut: CutConfig,
     ) -> Self {
@@ -281,7 +276,6 @@ impl Harness {
             summarizer,
             overflow,
             conflict,
-            scorer,
             limits,
             cut,
             tool_round_limit,
@@ -393,16 +387,6 @@ impl Harness {
         self.with_conflict(FnConflictDetector(f))
     }
 
-    pub fn with_scorer(mut self, scorer: impl PruneScorer + 'static) -> Self {
-        self.scorer = Arc::new(scorer);
-        self
-    }
-
-    pub fn with_scorer_arc(mut self, scorer: Arc<dyn PruneScorer>) -> Self {
-        self.scorer = scorer;
-        self
-    }
-
     pub fn with_limits(mut self, limits: HarnessLimits) -> Self {
         self.limits = limits;
         self
@@ -445,16 +429,6 @@ impl Harness {
 
     pub fn conflict_lanes(&self, calls: &[LlmToolCall]) -> Option<Vec<Vec<String>>> {
         self.conflict.lanes(calls)
-    }
-
-    pub fn decide(
-        &self,
-        tool: &str,
-        result_chars: usize,
-        rerunnable: bool,
-        is_error: bool,
-    ) -> PairVerdict {
-        self.scorer.decide(tool, result_chars, rerunnable, is_error)
     }
 
     pub fn limits(&self) -> HarnessLimits {
@@ -617,109 +591,6 @@ where
     }
 }
 
-/// Verdict for one tool_use → tool_result pair during verbatim pruning.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PairVerdict {
-    pub keep_call: bool,
-    pub keep_result: bool,
-}
-
-/// Scores one compacted pair without touching the transcript, so the rule
-/// is unit-testable and replaceable without forking the prune walk.
-pub trait PruneScorer: Send + Sync {
-    fn decide(
-        &self,
-        tool: &str,
-        result_chars: usize,
-        rerunnable: bool,
-        is_error: bool,
-    ) -> PairVerdict;
-}
-
-/// Size thresholds behind [`DefaultPruneScorer`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PruneThresholds {
-    pub keep_below_chars: usize,
-    pub truncate_above_chars: usize,
-    pub drop_above_chars: usize,
-}
-
-impl Default for PruneThresholds {
-    fn default() -> Self {
-        Self {
-            keep_below_chars: 500,
-            truncate_above_chars: 2_000,
-            drop_above_chars: 10_000,
-        }
-    }
-}
-
-/// Heuristic stand-in for the two live questions (call still matters?
-/// result still needed verbatim?).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct DefaultPruneScorer {
-    pub thresholds: PruneThresholds,
-}
-
-impl PruneScorer for DefaultPruneScorer {
-    fn decide(
-        &self,
-        _tool: &str,
-        result_chars: usize,
-        rerunnable: bool,
-        is_error: bool,
-    ) -> PairVerdict {
-        if result_chars < self.thresholds.keep_below_chars {
-            return PairVerdict {
-                keep_call: true,
-                keep_result: true,
-            };
-        }
-        if result_chars > self.thresholds.drop_above_chars {
-            if rerunnable && !is_error {
-                return PairVerdict {
-                    keep_call: false,
-                    keep_result: false,
-                };
-            }
-            return PairVerdict {
-                keep_call: true,
-                keep_result: false,
-            };
-        }
-        if result_chars > self.thresholds.truncate_above_chars {
-            return PairVerdict {
-                keep_call: true,
-                keep_result: false,
-            };
-        }
-        PairVerdict {
-            keep_call: true,
-            keep_result: true,
-        }
-    }
-}
-
-/// Closure prune scorer.
-pub struct FnPruneScorer<F>(pub F)
-where
-    F: Fn(&str, usize, bool, bool) -> PairVerdict + Send + Sync;
-
-impl<F> PruneScorer for FnPruneScorer<F>
-where
-    F: Fn(&str, usize, bool, bool) -> PairVerdict + Send + Sync,
-{
-    fn decide(
-        &self,
-        tool: &str,
-        result_chars: usize,
-        rerunnable: bool,
-        is_error: bool,
-    ) -> PairVerdict {
-        (self.0)(tool, result_chars, rerunnable, is_error)
-    }
-}
-
 /// Cut-point window for compaction: token-based keep-recent plus a
 /// message-count fallback. Replaces the scattered `KEEP_RECENT_*` consts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -756,7 +627,6 @@ pub struct HarnessLimits {
     pub max_tool_iterations: usize,
     pub max_compaction_attempts: usize,
     pub batch_max_concurrent: usize,
-    pub min_reduction_ratio: u32,
 }
 
 impl Default for HarnessLimits {
@@ -765,7 +635,6 @@ impl Default for HarnessLimits {
             max_tool_iterations: 200,
             max_compaction_attempts: 3,
             batch_max_concurrent: 10,
-            min_reduction_ratio: 25,
         }
     }
 }
@@ -783,10 +652,6 @@ impl HarnessLimits {
             max_tool_iterations,
             ..Self::default()
         }
-    }
-
-    pub fn reduction_ratio(&self) -> f64 {
-        f64::from(self.min_reduction_ratio) / 100.0
     }
 }
 
@@ -852,14 +717,6 @@ mod tests {
         assert!(!harness.conflicts(&[]));
         assert_eq!(harness.limits().max_tool_iterations, 7);
         assert_eq!(harness.cut().min_keep_messages, 4);
-        let verdict = harness.decide("read", 11_000, true, false);
-        assert_eq!(
-            verdict,
-            PairVerdict {
-                keep_call: false,
-                keep_result: false,
-            }
-        );
     }
 }
 

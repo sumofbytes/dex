@@ -24,14 +24,13 @@
 //! Each trait ships a default that preserves current behavior, and
 //! [`DexHarness`] threads the chosen impls through `DexTurnHost`,
 //! `run_tool_batch`, `emergency_compact`, `compaction_gate`,
-//! `compact_history`, and `prune_span`.
+//! and `compact_history`.
 
 use std::sync::Arc;
 
 use dex_agent_core::{
     CompactionBudget, CompactionTrigger, ConflictDetector, CutConfig, DefaultOverflowDetector,
-    DefaultPruneScorer, HarnessLimits, OverflowDetector, PruneScorer, PruneThresholds, Summarizer,
-    ToolCatalog,
+    HarnessLimits, OverflowDetector, Summarizer, ToolCatalog,
 };
 use dex_coding_agent::{ApprovalPolicy, ResultPolicy};
 use serde_json::{Map, Value};
@@ -413,7 +412,7 @@ impl RecoveryPolicy for DefaultRecoveryPolicy {
 ///
 /// `DexTurnHost` holds an `Arc<DexHarness>` and every helper
 /// (`compaction_gate`, `emergency_compact`, `run_tool_batch`,
-/// `compact_history`, `prune_span`, `prepare_tool_result`) takes the pieces
+/// `compact_history`, `prepare_tool_result`) takes the pieces
 /// it needs from it. `None` optionals select the config-derived behavior
 /// (compaction budget from `LlmConfig`, deterministic summary, default
 /// approval rows); providing them overrides exactly one decision.
@@ -425,7 +424,6 @@ pub struct DexHarness {
     pub summarizer: Option<Arc<dyn Summarizer>>,
     pub overflow: Arc<dyn OverflowDetector>,
     pub conflict: Arc<dyn ConflictDetector>,
-    pub scorer: Arc<dyn PruneScorer>,
     pub result_policy: ResultPolicy,
     pub approval: Option<Arc<dyn ApprovalPolicy>>,
     pub executor: Arc<dyn ToolExecutor>,
@@ -444,7 +442,6 @@ impl Default for DexHarness {
             summarizer: None,
             overflow: Arc::new(DefaultOverflowDetector),
             conflict: Arc::new(PathConflictDetector),
-            scorer: Arc::new(DefaultPruneScorer::default()),
             result_policy: ResultPolicy::default(),
             approval: None,
             executor: Arc::new(DefaultToolExecutor),
@@ -454,23 +451,6 @@ impl Default for DexHarness {
             recovery: Arc::new(DefaultRecoveryPolicy),
         }
     }
-}
-
-/// Effective prune thresholds: `harness:` file table over built-in defaults
-/// (`DexHarness::from_env` builds its scorer with these; `dex doctor` prints
-/// them so the row cannot drift from runtime behavior).
-pub fn prune_thresholds_from_env() -> PruneThresholds {
-    let mut prune = PruneThresholds::default();
-    if let Some(n) = file_usize("keep_below_chars") {
-        prune.keep_below_chars = n;
-    }
-    if let Some(n) = file_usize("truncate_above_chars") {
-        prune.truncate_above_chars = n;
-    }
-    if let Some(n) = file_usize("drop_above_chars") {
-        prune.drop_above_chars = n;
-    }
-    prune
 }
 
 impl DexHarness {
@@ -493,9 +473,6 @@ impl DexHarness {
             result_policy = result_policy.with_repeat_limit(n);
         }
         harness.result_policy = result_policy;
-        harness.scorer = Arc::new(DefaultPruneScorer {
-            thresholds: prune_thresholds_from_env(),
-        });
         harness
     }
 
@@ -579,16 +556,6 @@ impl DexHarness {
         f: impl Fn(&[LlmToolCall]) -> bool + Send + Sync + 'static,
     ) -> Self {
         self.with_conflict(dex_agent_core::FnConflictDetector(f))
-    }
-
-    pub fn with_scorer(mut self, scorer: impl PruneScorer + 'static) -> Self {
-        self.scorer = Arc::new(scorer);
-        self
-    }
-
-    pub fn with_scorer_arc(mut self, scorer: Arc<dyn PruneScorer>) -> Self {
-        self.scorer = scorer;
-        self
     }
 
     pub fn with_result_policy(mut self, policy: ResultPolicy) -> Self {

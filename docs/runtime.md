@@ -26,7 +26,6 @@ replacement safe — a turn can never see a half-applied composition.
 | `summarizer` | The compaction summary | deterministic checkpoint |
 | `overflow` | Context-overflow detection | threshold detector |
 | `conflict` | Whether a tool batch has conflicting calls | conflict detector |
-| `scorer` | Which stale tool outputs to prune/drop | heuristic scorer |
 | `approval` | Tool approval policy | built-in permission policy |
 | `executor` | How tool calls execute | built-in tool dispatcher |
 | `transcript` | Where transcript lines go | session store |
