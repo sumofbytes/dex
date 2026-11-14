@@ -14,7 +14,6 @@ use pure::{cap_running, next_id, retain_last8, MAX_FINISHED_RETAINED};
 
 /// Terminal or running status of one background task.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub enum TaskStatus {
     Running,
     Exited(i32),
@@ -52,7 +51,6 @@ pub fn signal_name(signal: i32) -> String {
 
 impl TaskStatus {
     /// One-word status for `list` rows and `TaskFinished` events.
-    #[allow(dead_code)]
     pub fn word(&self) -> String {
         match self {
             Self::Running => "running".to_string(),
@@ -74,7 +72,6 @@ impl TaskStatus {
 /// The async drain owns the `Child`; the registry keeps only `pid`
 /// (plus the drain `JoinHandle` at the call site, stored beside this).
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct BgTask {
     pub id: String,
     pub command: String,
@@ -111,7 +108,6 @@ impl BgTask {
 
 /// Completion notice queued for the next turn / idle wake.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)]
 pub struct TaskNotice {
     pub id: String,
     pub command: String,
@@ -119,7 +115,6 @@ pub struct TaskNotice {
     pub tail: String,
 }
 
-#[allow(dead_code)]
 impl TaskNotice {
     /// The lifecycle line drained into `agent-notifications` and journaled
     /// beside the typed `TaskFinished` event.
@@ -137,14 +132,12 @@ impl TaskNotice {
 
 /// Per-session registry: monotonic ids, running cap, finished retention.
 #[derive(Debug, Default)]
-#[allow(dead_code)]
 pub struct TaskRegistry {
     counter: u64,
     tasks: HashMap<String, BgTask>,
     finished_order: VecDeque<String>,
 }
 
-#[allow(dead_code)]
 impl TaskRegistry {
     pub fn new() -> Self {
         Self::default()
