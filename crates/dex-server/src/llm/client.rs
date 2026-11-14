@@ -87,11 +87,7 @@ pub(crate) fn http_call(
         scheme: config.provider.auth_scheme(),
         api_key: config.api_key.clone(),
         account_id: config.account_id.clone(),
-        headers: merged_headers(
-            &config.global_headers,
-            &config.provider_headers,
-            &config.extra_headers,
-        ),
+        headers: merged_headers(&config.provider_headers, &config.extra_headers),
         refresh: config
             .provider
             .credentials_refreshable()
@@ -566,11 +562,7 @@ mod tests {
         config
             .extra_headers
             .insert("not a header".to_string(), "bad".to_string());
-        let headers = merged_headers(
-            &config.global_headers,
-            &config.provider_headers,
-            &config.extra_headers,
-        );
+        let headers = merged_headers(&config.provider_headers, &config.extra_headers);
         let req = authenticated_request(
             config
                 .http_client()
@@ -611,16 +603,9 @@ mod tests {
             .provider_headers
             .insert("X-Both".to_string(), "prov".to_string());
         config
-            .global_headers
-            .insert("X-Both".to_string(), "global".to_string());
-        config
             .extra_headers
             .insert("X-Prov".to_string(), "env".to_string());
-        let headers = merged_headers(
-            &config.global_headers,
-            &config.provider_headers,
-            &config.extra_headers,
-        );
+        let headers = merged_headers(&config.provider_headers, &config.extra_headers);
         let req = authenticated_request(
             config
                 .http_client()

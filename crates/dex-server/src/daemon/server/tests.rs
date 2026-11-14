@@ -446,7 +446,6 @@ mod handler_tests {
             permission: crate::protocol::PermissionMode::Trusted,
             verify_command: None,
             extra_headers: Default::default(),
-            global_headers: Default::default(),
             provider_entries: Default::default(),
             provider_headers: Default::default(),
             api_pinned: false,
@@ -2130,7 +2129,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nproviders:\n  opencode:\n    base_url: {llm_base}\n    api: openai-completions\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -2321,7 +2320,7 @@ mod e2e_tests {
         .unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nproviders:\n  opencode:\n    base_url: {llm_base}\n    api: openai-completions\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -2474,7 +2473,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nproviders:\n  opencode:\n    base_url: {llm_base}\n    api: openai-completions\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -2824,7 +2823,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nproviders:\n  opencode:\n    base_url: {llm_base}\n    api: openai-completions\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
@@ -3074,7 +3073,11 @@ mod e2e_tests {
         let _env = crate::test_env::EnvGuard(saved);
         std::env::set_var("XDG_DATA_HOME", &data_dir);
         std::env::set_var("XDG_CACHE_HOME", data_dir.join("cache"));
-        std::fs::write(data_dir.join("config.yaml"), "api: openai-completions\n").unwrap();
+        std::fs::write(
+            data_dir.join("config.yaml"),
+            "providers:\n  opencode:\n    api: openai-completions\n",
+        )
+        .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
         std::env::set_var("OPENCODE_API_KEY", "test-key");
         std::env::set_var("DEX_PERMISSION", "ask-writes");
@@ -3221,7 +3224,7 @@ mod e2e_tests {
         std::fs::create_dir_all(&data_dir).unwrap();
         std::fs::write(
             data_dir.join("config.yaml"),
-            format!("model: opencode/test-model\ncontext_window: 100000\nbase_url: {llm_base}\napi: openai-completions\nproviders:\n  opencode:\n    api_key: test-key\n"),
+            format!("model: opencode/test-model\ncontext_window: 100000\nproviders:\n  opencode:\n    base_url: {llm_base}\n    api: openai-completions\n    api_key: test-key\n"),
         )
         .unwrap();
         std::env::set_var("DEX_CONFIG", data_dir.join("config.yaml"));
