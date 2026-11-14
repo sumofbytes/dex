@@ -23,11 +23,10 @@ pub use compaction::{
 };
 pub use components::{
     lane_deps, AlwaysCompact, CompactionTrigger, ConflictDetector, CutConfig,
-    DefaultOverflowDetector, DefaultPruneScorer, DeterministicSummarizer, FnCatalog,
-    FnConflictDetector, FnOverflowDetector, FnPruneScorer, FnSummarizer, FnTrigger, Harness,
-    HarnessLimits, NeverCompact, NeverConflict, OverflowDetector, PairVerdict, PruneScorer,
-    PruneThresholds, SerializeAll, StaticCatalog, StaticSummarizer, Summarizer, ToolCatalog,
-    BARRIER_LANE, OVERFLOW_PHRASES,
+    DefaultOverflowDetector, DeterministicSummarizer, FnCatalog, FnConflictDetector,
+    FnOverflowDetector, FnSummarizer, FnTrigger, Harness, HarnessLimits, NeverCompact,
+    NeverConflict, OverflowDetector, SerializeAll, StaticCatalog, StaticSummarizer, Summarizer,
+    ToolCatalog, BARRIER_LANE, OVERFLOW_PHRASES,
 };
 pub use lines::{ApprovalRequest, SinkLine};
 pub use modes::{AgentMode, PermissionMode};

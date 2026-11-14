@@ -51,7 +51,7 @@ pub struct AgentRuntime<'a, C, X> {
     /// Overwritable harness decisions for this turn (`None` = defaults with
     /// `DEX_MAX_TOOL_ITERATIONS` read once at turn setup). Pass a custom
     /// [`DexHarness`](crate::agent::composable::DexHarness) to swap one
-    /// piece — catalog, trigger, overflow wording, conflict rule, scorer,
+    /// piece — catalog, trigger, overflow wording, conflict rule,
     /// executor, transcript store — without forking the loop.
     pub harness: Option<std::sync::Arc<crate::agent::composable::DexHarness>>,
 }

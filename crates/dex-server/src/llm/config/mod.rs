@@ -331,7 +331,6 @@ const KNOWN_FILE_KEYS: &[&str] = &[
     "system_prompt_file",
     "mcp_servers",
     "agent_wake",
-    "cache_warming",
     "extensions",
     "harness",
     "harness_profile",
@@ -398,30 +397,6 @@ pub fn agent_wake_origin() -> (bool, &'static str) {
 /// The wake gate read by the scheduler: `true` unless disabled.
 pub fn agent_wake_enabled() -> bool {
     agent_wake_origin().0
-}
-
-/// The `cache_warming` knob: after a completed turn, re-send its last
-/// request once before the provider's prompt cache expires so the next
-/// turn reads the context at cache-hit price. Config `cache_warming:`
-/// (default on) with a `DEX_CACHE_WARMING` kill switch — env beats file,
-/// per the standard precedence. Returns the value plus its origin for
-/// `doctor`.
-pub fn cache_warming_origin() -> (bool, &'static str) {
-    if let Ok(raw) = env::var("DEX_CACHE_WARMING") {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "0" | "false" | "off" | "no" => return (false, "DEX_CACHE_WARMING"),
-            "1" | "true" | "on" | "yes" => return (true, "DEX_CACHE_WARMING"),
-            _ => {}
-        }
-    }
-    if let Some(enabled) = load_config_file()
-        .as_ref()
-        .and_then(|file| file.get("cache_warming"))
-        .and_then(|value| value.as_bool())
-    {
-        return (enabled, "config: cache_warming");
-    }
-    (true, "built-in default")
 }
 
 /// Verification opt-in shared by the daemon bootstrap and the one-shot CLI:

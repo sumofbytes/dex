@@ -131,7 +131,7 @@ Move them under the provider's entry in `providers:`.
 Unknown keys are called out by name (`dex: unknown config key(s) ...`) and a
 parse error lists the valid keys: `model`, `providers`, `context_window`,
 `thinking_effort`, `system_prompt`, `system_prompt_file`, `mcp_servers`,
-`agent_wake`, `cache_warming`, `extensions` (+ the legacy
+`agent_wake`, `extensions` (+ the legacy
 ones above). Other keys are preserved untouched.
 
 ## System prompt

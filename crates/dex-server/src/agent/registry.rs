@@ -11,8 +11,7 @@
 //! Built-ins register the selectable alternatives that exist today
 //! (`catalog: native-only`, `trigger: never`); everything else is a single
 //! Rust default reachable via `DexHarness::from_env`. Selecting an id
-//! `default` is a no-op (keeps the env-derived defaults, e.g. the
-//! `harness:`-table prune thresholds on the scorer). Unknown slots or ids
+//! `default` is a no-op (keeps the env-derived defaults). Unknown slots or ids
 //! `warn_once` and fall back to the default — never fail a turn.
 
 use std::any::Any;
@@ -20,8 +19,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use dex_agent_core::{
-    CompactionTrigger, ConflictDetector, NeverCompact, OverflowDetector, PruneScorer, Summarizer,
-    ToolCatalog,
+    CompactionTrigger, ConflictDetector, NeverCompact, OverflowDetector, Summarizer, ToolCatalog,
 };
 use dex_coding_agent::ApprovalPolicy;
 
@@ -38,7 +36,6 @@ pub const SLOTS: &[&str] = &[
     "summarizer",
     "overflow",
     "conflict",
-    "scorer",
     "approval",
     "executor",
     "transcript",
@@ -240,8 +237,7 @@ pub fn resolve_snapshot_with_origins() -> (Arc<DexHarness>, Vec<SlotRow>) {
             continue;
         };
         if id == "default" {
-            // Explicit default: keep whatever `from_env` built (its scorer
-            // carries the `harness:` thresholds).
+            // Explicit default: keep whatever `from_env` built.
             rows.push(SlotRow {
                 slot: name,
                 selection: None,
@@ -284,7 +280,6 @@ fn apply_slot(harness: &mut DexHarness, slot: &str, id: &str) -> bool {
         "summarizer" => lookup::<dyn Summarizer>(slot, id).map(|v| harness.summarizer = Some(v)),
         "overflow" => lookup::<dyn OverflowDetector>(slot, id).map(|v| harness.overflow = v),
         "conflict" => lookup::<dyn ConflictDetector>(slot, id).map(|v| harness.conflict = v),
-        "scorer" => lookup::<dyn PruneScorer>(slot, id).map(|v| harness.scorer = v),
         "approval" => lookup::<dyn ApprovalPolicy>(slot, id).map(|v| harness.approval = Some(v)),
         "executor" => lookup::<dyn ToolExecutor>(slot, id).map(|v| harness.executor = v),
         "transcript" => lookup::<dyn TranscriptStore>(slot, id).map(|v| harness.transcript = v),
