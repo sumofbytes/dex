@@ -5,8 +5,10 @@
 //! `eza --icons`) is full of them, so the slot must name a family that has them. The static list
 //! covers the common cases (`ui-monospace` is the user's own monospace on every platform — Rune
 //! expands it via `fc-match`/SF Mono/Cascadia); this scan adds whatever icon-capable family is
-//! installed under any other name. Probing is exact: a font is kept only if its charmap maps the
-//! probe codepoints, so name-based keyword filtering can be loose.
+//! installed under another name. Only families whose name looks icon-capable are probed (Nerd
+//! Font patches always say so: "… Nerd Font", "… NF"): loading every installed font to read its
+//! charmap would stall startup on machines with large font sets. Probing is exact — a font is
+//! kept only if its charmap maps the probe codepoints — so the name filter can be loose.
 
 use fontique::{Collection, CollectionOptions, SourceCache, SourceCacheOptions};
 
@@ -21,8 +23,7 @@ const PROBES: [char; 2] = ['\u{E0B0}', '\u{F07B}'];
 /// How many discovered families to name at most — a CSS list shouldn't grow unbounded.
 const MAX_NAMES: usize = 3;
 
-/// Lowercase fragments that mark a family worth probing first; anything else is scanned only
-/// when these find nothing.
+/// Lowercase fragments that mark a family worth probing.
 const KEYWORDS: [&str; 5] = ["nerd", "nf", "symbol", "icon", "powerline"];
 
 /// The mono slot families for this machine, as a process-lifetime string (`AppSpec::families`
@@ -53,27 +54,20 @@ fn discovered() -> String {
         .map(|f| f.to_lowercase())
         .collect::<Vec<_>>();
 
-    let (likely, rest): (Vec<_>, Vec<_>) = names.into_iter().partition(|(name, _)| {
-        let name = name.to_lowercase();
-        KEYWORDS.iter().any(|kw| name.contains(kw))
-    });
     let mut found: Vec<String> = Vec::new();
-    for (batch, thorough) in [(&likely, false), (&rest, true)] {
-        for (name, id) in batch {
-            let lowered = name.to_lowercase();
-            if base.contains(&lowered) || found.iter().any(|f| f.eq_ignore_ascii_case(name)) {
-                continue;
-            }
-            if covers_probes(&mut collection, *id) {
-                found.push(name.clone());
-                if found.len() == MAX_NAMES {
-                    break;
-                }
-            }
+    for (name, id) in names {
+        let lowered = name.to_lowercase();
+        if !KEYWORDS.iter().any(|kw| lowered.contains(kw))
+            || base.contains(&lowered)
+            || found.iter().any(|f| f.eq_ignore_ascii_case(&name))
+        {
+            continue;
         }
-        // Found in the keyword pass: the expensive full scan is unnecessary.
-        if !found.is_empty() && !thorough {
-            break;
+        if covers_probes(&mut collection, id) {
+            found.push(name);
+            if found.len() == MAX_NAMES {
+                break;
+            }
         }
     }
     found.join(", ")

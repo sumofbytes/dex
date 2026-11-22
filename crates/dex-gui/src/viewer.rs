@@ -22,6 +22,10 @@ const OUTPUT_LINES: usize = 300;
 pub const WIDTH: f32 = 460.0;
 const MAX_ROWS: usize = 200;
 const MAX_LINES: usize = 3000;
+/// Terminal rows drawn: the tail of the scrollback, as a paragraph thousands of lines tall
+/// is slow to lay out.
+#[cfg(unix)]
+const TERM_ROWS_SHOWN: usize = 200;
 
 fn lang(path: &str) -> Option<&'static str> {
     Some(match path.rsplit('.').next()? {
@@ -321,11 +325,8 @@ fn terminal_shell(s: &State, k: &Kit) -> El {
         .child(breadcrumb(&dir, k).grow(1.0).min_w(0.0))
         .child(status);
 
-    // The renderer keeps the last `TERM_LINES` lines; only the tail is drawn, as a paragraph
-    // thousands of lines tall is slow to lay out.
-    let rows = s.term_screen.rows();
-    let shown = rows.len().saturating_sub(MAX_ROWS);
-    let body = rows[shown..].join("\n");
+    // The renderer keeps the last `TERM_LINES` lines; only the tail is drawn.
+    let body = s.term_screen.tail(TERM_ROWS_SHOWN);
     let pane = col()
         .key("term-screen")
         .w_full()

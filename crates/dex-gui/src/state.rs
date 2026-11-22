@@ -306,6 +306,10 @@ pub struct State {
     /// Where the shell started (the project directory when its tab opened).
     #[cfg(unix)]
     pub term_dir: Option<String>,
+    /// The last shell start failed: keypresses no longer retry it (reopening the tab does),
+    /// so a broken `$SHELL` does not print its error once per key.
+    #[cfg(unix)]
+    pub term_spawn_failed: bool,
     #[cfg(not(unix))]
     pub term: Vec<TermBlock>,
     #[cfg(not(unix))]
@@ -379,6 +383,8 @@ impl Default for State {
             term_pty: None,
             #[cfg(unix)]
             term_dir: None,
+            #[cfg(unix)]
+            term_spawn_failed: false,
             #[cfg(not(unix))]
             term: Vec::new(),
             #[cfg(not(unix))]
@@ -996,10 +1002,15 @@ impl State {
             }
         };
         match crate::term::Pty::spawn(&dir, post_out, post_exit) {
-            Ok(pty) => self.term_pty = Some(pty),
-            Err(e) => self
-                .term_screen
-                .feed(&format!("could not start a shell: {e}\r\n")),
+            Ok(pty) => {
+                self.term_pty = Some(pty);
+                self.term_spawn_failed = false;
+            }
+            Err(e) => {
+                self.term_spawn_failed = true;
+                self.term_screen
+                    .feed(&format!("could not start a shell: {e}\r\n"));
+            }
         }
     }
 
@@ -1008,7 +1019,7 @@ impl State {
     /// pane consumed the key.
     #[cfg(unix)]
     pub fn term_key(&mut self, e: &rune::KeyEvent) -> bool {
-        if self.term_pty.is_none() {
+        if self.term_pty.is_none() && !self.term_spawn_failed {
             self.term_open();
         }
         let Some(bytes) = crate::term::key_bytes(e) else {
