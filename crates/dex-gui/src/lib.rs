@@ -3,11 +3,14 @@
 //! Headless render: `dex-gui --snap out.png --scene chat`. Linked into `dex` behind its `gui` feature.
 
 mod composer_menu;
+mod font_fallback;
 mod home;
 mod icons;
 mod sidebar;
 mod state;
 mod style;
+#[cfg(unix)]
+mod term;
 mod theme;
 mod theme_picker;
 mod view;
@@ -23,6 +26,7 @@ fn setup(s: &mut State, wake: Waker) {
     let (tx, rx) = mpsc::unbounded_channel::<Cmd>();
     s.cmds = Some(tx);
     s.load_hidden();
+    #[cfg(not(unix))]
     s.load_term_history();
     s.load_theme();
     s.wake = Some(wake.clone());
@@ -333,22 +337,41 @@ fn files_scene(s: &mut State) {
 
 fn term_scene(s: &mut State) {
     viewer_scene(s, state::VTab::Terminal);
-    s.term = vec![
-        state::TermBlock {
-            cmd: "git log --oneline -3".into(),
-            lines: vec![
-                "9cdca96 feat(gui): replicate the Paper design v2".into(),
-                "cb34053 fix(gui): align the footer with the composer".into(),
-                "03ba94e docs(gui): proposed composer option menus".into(),
-            ],
-            status: state::TermStatus::Done { code: 0, secs: 0.1 },
-        },
-        state::TermBlock {
-            cmd: "cargo test viewer".into(),
-            lines: vec!["error[E0433]: cannot find `theme` in this scope".into()],
-            status: state::TermStatus::Done { code: 1, secs: 2.4 },
-        },
-    ];
+    // A snapshot of the live shell's screen (Unix), or of the runner's blocks where there is
+    // no PTY.
+    #[cfg(unix)]
+    {
+        for l in [
+            "git log --oneline -3",
+            "9cdca96 feat(gui): replicate the Paper design v2",
+            "cb34053 fix(gui): align the footer with the composer",
+            "$ cargo test viewer",
+            "error[E0433]: cannot find `theme` in this scope",
+            // A Nerd Font private-use glyph (eza's folder icon) beside a control: it must draw.
+            "\u{f07b} nerd-glyph",
+        ] {
+            s.term_screen.feed(&format!("{l}\r\n"));
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        s.term = vec![
+            state::TermBlock {
+                cmd: "git log --oneline -3".into(),
+                lines: vec![
+                    "9cdca96 feat(gui): replicate the Paper design v2".into(),
+                    "cb34053 fix(gui): align the footer with the composer".into(),
+                    "03ba94e docs(gui): proposed composer option menus".into(),
+                ],
+                status: state::TermStatus::Done { code: 0, secs: 0.1 },
+            },
+            state::TermBlock {
+                cmd: "cargo test viewer".into(),
+                lines: vec!["error[E0433]: cannot find `theme` in this scope".into()],
+                status: state::TermStatus::Done { code: 1, secs: 2.4 },
+            },
+        ];
+    }
 }
 
 fn wt_scene(s: &mut State) {
@@ -613,7 +636,16 @@ pub fn run() -> bool {
         poll: Some(poll),
         on_key: Some(on_key),
         fonts: rune_theme_opencode::FONTS,
-        families: rune_theme_opencode::FAMILIES,
+        // The theme's families with the mono slot extended. Shell output (starship's prompt,
+        // `eza --icons`) draws private-use glyphs the base mono faces lack, and Rune looks for
+        // those only among the families a slot names — never as a system fallback. The static
+        // list puts the user's own monospace in the stack (where Nerd Font icons usually live)
+        // ahead of the NF faces it names; `font_fallback` then appends whatever icon-capable
+        // family is installed under any other name. Uninstalled families are skipped.
+        families: (
+            rune_theme_opencode::FAMILIES.0,
+            font_fallback::mono_families(),
+        ),
         ..AppSpec::new("dex", (1100.0, 760.0), State::default, view::view)
     })
     .chrome(chrome)

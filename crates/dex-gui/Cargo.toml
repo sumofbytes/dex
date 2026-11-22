@@ -16,6 +16,12 @@ dex-server = { path = "../dex-server" }
 rune = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", features = ["native-file-dialog"] }
 rune-kit = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", features = ["markdown"] }
 rune-theme-opencode = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50" }
+# Same 0.12 the Rune tree pins; used to probe installed fonts' charmaps for icon coverage.
+fontique = "0.12"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros"] }
+# The Terminal tab's PTY (openpty, ioctl, read/write) on Unix; no Windows ConPTY yet —
+# there the tab keeps its one-shot command runner.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
