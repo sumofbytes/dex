@@ -1,22 +1,31 @@
 //! Right-hand viewer pane: the project's files with a syntax-coloured preview, and its
 //! uncommitted changes as a diff.
 
-use rune::{El, ScrollSpec, col, el, row, text, text_input};
+#[cfg(not(unix))]
+use rune::el;
+use rune::{El, ScrollSpec, col, row, text, text_input};
 use rune_kit::diff::DiffView;
 use rune_kit::shell::{Sidebar, SidebarRow};
 use rune_kit::syntax::{self, SyntaxTheme};
 use rune_kit::{IconButton, IconButtonVariant, Kit};
 
-use crate::state::{State, TermBlock, TermStatus, VTab};
+use crate::state::{State, VTab};
+#[cfg(not(unix))]
+use crate::state::{TermBlock, TermStatus};
 use crate::style::{space, typo};
 use crate::theme;
 
 /// Output lines shown per command block; older ones are hidden.
+#[cfg(not(unix))]
 const OUTPUT_LINES: usize = 300;
 
 pub const WIDTH: f32 = 460.0;
 const MAX_ROWS: usize = 200;
 const MAX_LINES: usize = 3000;
+/// Terminal rows drawn: the tail of the scrollback, as a paragraph thousands of lines tall
+/// is slow to lay out.
+#[cfg(unix)]
+const TERM_ROWS_SHOWN: usize = 200;
 
 fn lang(path: &str) -> Option<&'static str> {
     Some(match path.rsplit('.').next()? {
@@ -266,6 +275,110 @@ fn breadcrumb(path: &str, k: &Kit) -> El {
 }
 
 fn terminal(s: &State, k: &Kit) -> El {
+    #[cfg(unix)]
+    {
+        terminal_shell(s, k)
+    }
+    #[cfg(not(unix))]
+    {
+        terminal_runner(s, k)
+    }
+}
+
+/// The Terminal tab on Unix: the project's shell running live in a pseudo-terminal. The
+/// renderer's rows are one paragraph; the pane owns the keyboard while focused and forwards
+/// every key to the shell, spelled the way a terminal spells it.
+#[cfg(unix)]
+fn terminal_shell(s: &State, k: &Kit) -> El {
+    let dir = s.term_dir.clone().unwrap_or_else(|| s.cwd());
+    let shell_alive = s.term_pty.is_some();
+    let status = row()
+        .gap(space::SM)
+        .items_center()
+        .child(crate::style::dot(
+            if shell_alive {
+                theme::done()
+            } else {
+                theme::waiting()
+            },
+            6.0,
+        ))
+        .child(
+            text(if shell_alive {
+                "shell"
+            } else {
+                "exited · press a key to restart"
+            })
+            .font(typo::caption(k))
+            .color(if shell_alive {
+                theme::done()
+            } else {
+                theme::waiting()
+            }),
+        );
+    let header = row()
+        .w_full()
+        .h(40.0)
+        .px(space::XL)
+        .gap(space::MD)
+        .items_center()
+        .child(breadcrumb(&dir, k).grow(1.0).min_w(0.0))
+        .child(status);
+
+    // The renderer keeps the last `TERM_LINES` lines; only the tail is drawn.
+    let body = s.term_screen.tail(TERM_ROWS_SHOWN);
+    let pane = col()
+        .key("term-screen")
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .scroll(ScrollSpec { stick_bottom: true })
+        .padding(16.0)
+        .child(if body.is_empty() {
+            col().w_full().py(48.0).items_center().child(
+                text(if shell_alive {
+                    "Starting the project shell…"
+                } else {
+                    "The shell exited — press any key to start it again."
+                })
+                .font(k.ty.body_medium)
+                .color(k.c.text_faint),
+            )
+        } else {
+            text(body)
+                .font(k.ty.mono.lh(18.0))
+                .color(k.c.text_base)
+                .wrap()
+        })
+        // The pane owns the keyboard while it is focused: every key the shell can use goes
+        // to it, the rest (PageUp's scroll, app shortcuts a shell key does not shadow) falls
+        // through to Rune.
+        .focusable(true)
+        .on_key(|s: &mut State, e: &rune::KeyEvent, _: &mut rune::Tx| s.term_key(e));
+
+    col()
+        .w_full()
+        .grow(1.0)
+        .min_h(0.0)
+        .child(header)
+        .child(pane)
+        .child(
+            col()
+                .w_full()
+                .px(space::XXL)
+                .py(space::MD)
+                .child(
+                    text(
+                        "The project's shell in a live terminal · Ctrl-C interrupts · PageUp scrolls · Ctrl-` closes",
+                    )
+                    .font(typo::caption(k))
+                    .color(k.c.text_faint),
+                ),
+        )
+}
+
+#[cfg(not(unix))]
+fn terminal_runner(s: &State, k: &Kit) -> El {
     let dir = s.term_cwd.clone().unwrap_or_else(|| s.cwd());
     let header = row()
         .w_full()
@@ -395,6 +508,7 @@ fn terminal(s: &State, k: &Kit) -> El {
 
 /// One command block: `$ command` with its status on the right, then its output, the last
 /// `OUTPUT_LINES` lines, under a rule.
+#[cfg(not(unix))]
 fn term_block(i: usize, b: &TermBlock, k: &Kit) -> El {
     let status = match &b.status {
         TermStatus::Running { started } => row()

@@ -68,13 +68,20 @@ pub enum Msg {
     /// The directory the current thread works in changed (a worktree was made).
     Project(String),
     /// Project files (relative) and the working-tree patch from a background `git` scan.
-    /// One line of the terminal's running command's output.
+    /// One line of the terminal's running command's output (the one-shot runner; Unix streams
+    /// `TermOut` chunks from the shell's PTY instead).
+    #[cfg(not(unix))]
     TermLine(String),
-    /// The terminal's command ended with this exit code after `secs`.
+    /// The terminal's command ended with this exit code after `secs` (the one-shot runner).
+    #[cfg(not(unix))]
     TermDone {
         code: i32,
         secs: f64,
     },
+    /// Raw output the Terminal tab's shell wrote to its PTY.
+    TermOut(String),
+    /// The Terminal tab's shell exited (its PTY closed).
+    TermExit,
     Scanned {
         cwd: String,
         files: Vec<String>,
@@ -152,19 +159,24 @@ pub struct Queued {
     pub followup: bool,
 }
 
-/// How many command blocks the terminal keeps, and lines kept per block.
-pub const TERM_BLOCKS: usize = 100;
+/// Lines kept per command block, and scrollback lines kept by the Terminal tab's screen.
 pub const TERM_LINES: usize = 2000;
-/// Saved terminal commands kept.
+/// How many command blocks the terminal keeps, and saved terminal commands kept
+/// (the one-shot runner the Terminal tab uses where there is no PTY).
+#[cfg(not(unix))]
+pub const TERM_BLOCKS: usize = 100;
+#[cfg(not(unix))]
 pub const TERM_HISTORY: usize = 1000;
 
 /// One command the terminal ran: the command, its output lines, and how it ended.
+#[cfg(not(unix))]
 pub struct TermBlock {
     pub cmd: String,
     pub lines: Vec<String>,
     pub status: TermStatus,
 }
 
+#[cfg(not(unix))]
 pub enum TermStatus {
     Running { started: std::time::Instant },
     Done { code: i32, secs: f64 },
@@ -282,13 +294,34 @@ pub struct State {
     pub open_file: Option<OpenFile>,
     pub diff: DiffState,
     pub scanned: Option<String>,
+    /// The terminal's rendered scrollback: what the shell wrote, minus the escape codes the
+    /// minimal line renderer does not draw. Unix only — where there is no PTY the tab keeps
+    /// the one-shot runner below.
+    #[cfg(unix)]
+    pub term_screen: crate::term::TermScreen,
+    /// The running shell's PTY: `None` until the Terminal tab opens, and again once it exits
+    /// (the next keypress restarts it).
+    #[cfg(unix)]
+    pub term_pty: Option<std::sync::Arc<crate::term::Pty>>,
+    /// Where the shell started (the project directory when its tab opened).
+    #[cfg(unix)]
+    pub term_dir: Option<String>,
+    /// The last shell start failed: keypresses no longer retry it (reopening the tab does),
+    /// so a broken `$SHELL` does not print its error once per key.
+    #[cfg(unix)]
+    pub term_spawn_failed: bool,
+    #[cfg(not(unix))]
     pub term: Vec<TermBlock>,
+    #[cfg(not(unix))]
     pub term_input: TextEdit,
     /// Commands run in the terminal, oldest first, saved in the data directory.
+    #[cfg(not(unix))]
     pub term_history: Vec<String>,
     /// While the input walks history: where it is and the input's text before the walk
     /// started (the text Ctrl+R then searches for).
+    #[cfg(not(unix))]
     pub term_hist: Option<(usize, String)>,
+    #[cfg(not(unix))]
     pub term_cwd: Option<String>,
     pub wake: Option<Waker>,
     pub inbox: Arc<Inbox>,
@@ -344,10 +377,23 @@ impl Default for State {
             open_file: None,
             diff: DiffState::new(Vec::new()),
             scanned: None,
+            #[cfg(unix)]
+            term_screen: crate::term::TermScreen::default(),
+            #[cfg(unix)]
+            term_pty: None,
+            #[cfg(unix)]
+            term_dir: None,
+            #[cfg(unix)]
+            term_spawn_failed: false,
+            #[cfg(not(unix))]
             term: Vec::new(),
+            #[cfg(not(unix))]
             term_input: TextEdit::default(),
+            #[cfg(not(unix))]
             term_history: Vec::new(),
+            #[cfg(not(unix))]
             term_hist: None,
+            #[cfg(not(unix))]
             term_cwd: None,
             wake: None,
             inbox: Arc::default(),
@@ -407,7 +453,8 @@ impl State {
         self.turn() != Turn::Idle
     }
 
-    /// A terminal command is running: the last block has not ended.
+    /// A terminal command is running: the last block has not ended (the one-shot runner).
+    #[cfg(not(unix))]
     pub fn term_running(&self) -> bool {
         matches!(
             self.term.last().map(|b| &b.status),
@@ -605,6 +652,7 @@ impl State {
             }
             Msg::Status(s) => self.status = s,
             Msg::Project(p) => self.project = Some(p),
+            #[cfg(not(unix))]
             Msg::TermLine(line) => {
                 if let Some(b) = self.term.last_mut() {
                     b.lines.push(strip_ansi(line.trim_end_matches('\r')));
@@ -614,9 +662,22 @@ impl State {
                     }
                 }
             }
+            #[cfg(not(unix))]
             Msg::TermDone { code, secs } => {
                 if let Some(b) = self.term.last_mut() {
                     b.status = TermStatus::Done { code, secs };
+                }
+            }
+            Msg::TermOut(chunk) => {
+                #[cfg(unix)]
+                self.term_screen.feed(&chunk);
+                #[cfg(not(unix))]
+                let _ = chunk;
+            }
+            Msg::TermExit => {
+                #[cfg(unix)]
+                {
+                    self.term_pty = None;
                 }
             }
             Msg::Scanned { cwd, files, patch } => {
@@ -897,6 +958,12 @@ impl State {
         }
         self.viewer = true;
         self.vtab = tab;
+        // Opening the Terminal tab starts the shell (an open shell keeps running while its
+        // tab is closed; only its exit stops it).
+        #[cfg(unix)]
+        if tab == VTab::Terminal {
+            self.term_open();
+        }
         self.rescan();
     }
 
@@ -911,7 +978,64 @@ impl State {
         });
     }
 
-    /// Read the saved terminal command history, if there was one.
+    /// Start the Terminal tab's shell in the project directory (Unix: a real PTY, so
+    /// readline, Ctrl-C and interactive programs work). A shell that exited restarts.
+    #[cfg(unix)]
+    pub fn term_open(&mut self) {
+        if self.term_pty.is_some() {
+            return;
+        }
+        let dir = self.cwd();
+        self.term_dir = Some(dir.clone());
+        let (out_inbox, out_wake) = (self.inbox.clone(), self.wake.clone());
+        let (exit_inbox, exit_wake) = (self.inbox.clone(), self.wake.clone());
+        let post_out = move |chunk: String| {
+            out_inbox.0.lock().unwrap().push(Msg::TermOut(chunk));
+            if let Some(w) = &out_wake {
+                w();
+            }
+        };
+        let post_exit = move || {
+            exit_inbox.0.lock().unwrap().push(Msg::TermExit);
+            if let Some(w) = &exit_wake {
+                w();
+            }
+        };
+        match crate::term::Pty::spawn(&dir, post_out, post_exit) {
+            Ok(pty) => {
+                self.term_pty = Some(pty);
+                self.term_spawn_failed = false;
+            }
+            Err(e) => {
+                self.term_spawn_failed = true;
+                self.term_screen
+                    .feed(&format!("could not start a shell: {e}\r\n"));
+            }
+        }
+    }
+
+    /// A keypress while the Terminal pane has focus: forward it to the shell, spelled the way
+    /// a terminal spells it (Enter is `\r`, Up is its escape code, ...). Returns whether the
+    /// pane consumed the key.
+    #[cfg(unix)]
+    pub fn term_key(&mut self, e: &rune::KeyEvent) -> bool {
+        if self.term_pty.is_none() && !self.term_spawn_failed {
+            self.term_open();
+        }
+        let Some(bytes) = crate::term::key_bytes(e) else {
+            return false;
+        };
+        match self.term_pty.as_ref() {
+            Some(pty) => {
+                pty.write(&bytes);
+                true
+            }
+            None => false, // spawning failed: let the key fall through
+        }
+    }
+
+    /// Read the saved terminal command history, if there was one (the one-shot runner).
+    #[cfg(not(unix))]
     pub fn load_term_history(&mut self) {
         let Some(path) = term_history_file() else {
             return;
@@ -922,6 +1046,7 @@ impl State {
     }
 
     /// Remember a command in the history (adjacent repeats dropped) and save it.
+    #[cfg(not(unix))]
     pub fn push_term_history(&mut self, cmd: &str) {
         if self.term_history.last().map(String::as_str) == Some(cmd) {
             return;
@@ -941,6 +1066,7 @@ impl State {
     }
 
     /// Put history entry `i` in the input, caret at the end.
+    #[cfg(not(unix))]
     fn recall_term(&mut self, i: usize) {
         if let Some(t) = self.term_history.get(i) {
             self.term_input.replace_text(t.clone());
@@ -948,6 +1074,7 @@ impl State {
     }
 
     /// Up: one step back through the history, from the input's own text.
+    #[cfg(not(unix))]
     pub fn term_hist_up(&mut self) {
         if self.term_history.is_empty() {
             return;
@@ -966,6 +1093,7 @@ impl State {
     }
 
     /// Down: forward through the history, past the newest back to the unsent text.
+    #[cfg(not(unix))]
     pub fn term_hist_down(&mut self) {
         let Some((pos, draft)) = self.term_hist.take() else {
             return;
@@ -985,6 +1113,7 @@ impl State {
     /// Ctrl+R: the most recent command containing the field's text — the text the walk started
     /// from, once a match is shown. Again finds the next older match; an empty field behaves
     /// like Up.
+    #[cfg(not(unix))]
     pub fn term_hist_search(&mut self) {
         let (pos, query) = match &self.term_hist {
             Some((p, q)) => (*p, q.clone()),
@@ -1005,6 +1134,7 @@ impl State {
 
     /// Run the terminal input as a shell command in the project directory, streaming its output
     /// into a new block. Not a PTY: interactive programs (editors, pagers) do not work.
+    #[cfg(not(unix))]
     pub fn run_term(&mut self) {
         let cmd = self.term_input.text.trim().to_string();
         if cmd.is_empty() || self.term_running() {
@@ -1099,6 +1229,7 @@ impl State {
     }
 
     /// Forget the terminal's history, unless a command is still running.
+    #[cfg(not(unix))]
     pub fn clear_term(&mut self) {
         if !self.term_running() {
             self.term.clear();
@@ -1275,6 +1406,7 @@ fn hidden_file() -> Option<std::path::PathBuf> {
 }
 
 /// Where the terminal's command history is saved.
+#[cfg(not(unix))]
 fn term_history_file() -> Option<std::path::PathBuf> {
     Some(crate::worktree::data_dir().join("gui-term-history"))
 }
@@ -1371,6 +1503,7 @@ fn args_line(args: &serde_json::Value) -> String {
     s.lines().next().unwrap_or("").chars().take(120).collect()
 }
 
+#[cfg(not(unix))]
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut it = s.chars().peekable();
@@ -1665,6 +1798,42 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
+    fn opening_the_terminal_tab_starts_a_shell() {
+        let mut s = State {
+            project: Some(std::env::temp_dir().display().to_string()),
+            ..State::default()
+        };
+        assert!(s.term_pty.is_none());
+        s.show_viewer(VTab::Terminal);
+        assert!(s.term_pty.is_some(), "opening the tab starts the shell");
+        // Typing reaches the shell; the pane's own scroll keys stay in the pane.
+        assert!(s.term_key(&rune::KeyEvent {
+            key: rune::Key::Text("echo hi\r".into()),
+            mods: rune::Mods::default(),
+        }));
+        assert!(!s.term_key(&rune::KeyEvent {
+            key: rune::Key::PageUp,
+            mods: rune::Mods::default(),
+        }));
+        // The shell exits: the PTY closes, and the next keypress would restart it.
+        assert!(s.term_key(&rune::KeyEvent {
+            key: rune::Key::Text("exit\r".into()),
+            mods: rune::Mods::default(),
+        }));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while s.term_pty.is_some() && std::time::Instant::now() < deadline {
+            let msgs: Vec<Msg> = std::mem::take(&mut *s.inbox.0.lock().unwrap());
+            for m in msgs {
+                s.apply(m);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(s.term_pty.is_none(), "the shell exited and the PTY closed");
+    }
+
+    #[test]
+    #[cfg(not(unix))]
     fn terminal_runs_a_command_and_streams_output() {
         let mut s = State {
             project: Some(std::env::temp_dir().display().to_string()),
@@ -1690,6 +1859,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(unix))]
     fn terminal_input_walks_history() {
         let mut s = State::default();
         s.push_term_history("echo a");
@@ -1710,6 +1880,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(unix))]
     fn terminal_input_searches_history() {
         let mut s = State::default();
         for c in ["cargo build", "cargo test", "git status"] {
@@ -1725,6 +1896,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(unix))]
     fn terminal_search_walks_older_matches() {
         let mut s = State::default();
         for c in ["cargo build", "cargo test one", "cargo test two"] {

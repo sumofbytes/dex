@@ -1,0 +1,571 @@
+//! The viewer's Terminal tab, on Unix: the user's `$SHELL` running in a real pseudo-terminal,
+//! so everything a terminal does works — readline prompts and history, `Ctrl-C`, `Ctrl-D`,
+//! REPLs and programs that read stdin. Keys are forwarded to the PTY as bytes
+//! ([`key_bytes`]); the shell's output is rendered by [`TermScreen`], a minimal line renderer:
+//! it honours the sequences a prompt and a scroll of command output use (carriage return,
+//! backspace, tab, erase-in-line, clear-screen) and strips the rest (colours, cursor
+//! addressing), so full-screen programs (`vim`, `htop`) are still out of scope.
+
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::process::CommandExt;
+use std::sync::{Arc, mpsc};
+
+use rune::{Key, KeyEvent};
+
+/// Terminal size reported to the shell. The pane is 460-640pt wide (a little over 80 mono
+/// columns), so 80x24 matches what fits without a resize dance.
+const COLS: u16 = 80;
+const ROWS: u16 = 24;
+
+/// A live shell's side of a pseudo-terminal. The shell holds the slave; the reader thread in
+/// [`Pty::spawn`] holds its own copy of the master until EOF, and the writer thread holds
+/// another until this handle (and so its sender) is dropped.
+pub struct Pty {
+    tx: mpsc::Sender<Vec<u8>>,
+}
+
+impl Pty {
+    /// Run the user's `$SHELL` (or `sh`) in a PTY inside `dir`, streaming its output as
+    /// `on_out` chunks and calling `on_exit` when the master hits EOF (the shell exited).
+    pub fn spawn(
+        dir: &str,
+        on_out: impl Fn(String) + Send + 'static,
+        on_exit: impl Fn() + Send + 'static,
+    ) -> io::Result<Arc<Pty>> {
+        let mut master: libc::c_int = 0;
+        let mut slave: libc::c_int = 0;
+        // macOS declares the termios/winsize arguments `*mut`, Linux `*const`: a `*mut` cast
+        // to the inferred pointer type fits either.
+        let mut ws = libc::winsize {
+            ws_row: ROWS,
+            ws_col: COLS,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: openpty writes two fds out, owns no other state we touch.
+        let rc = unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                (&raw mut ws) as _,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: openpty just returned these fds, and nothing else owns them.
+        let (master, slave) =
+            unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+        // openpty does not set close-on-exec: without it the shell (and anything else the app
+        // spawns) inherits the master, so closing ours would never hang the shell up.
+        for fd in [&master, &slave] {
+            // SAFETY: fcntl on a fd we own.
+            if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "sh".into());
+        let mut cmd = std::process::Command::new(&shell);
+        cmd.current_dir(dir)
+            .stdin(slave.try_clone()?)
+            .stdout(slave.try_clone()?)
+            .stderr(slave.try_clone()?)
+            // Whatever terminal launched the app, programs here talk to this renderer, so
+            // they should emit plain xterm sequences (not, say, kitty's).
+            .env("TERM", "xterm-256color");
+        // The child needs its own session with the slave as its controlling terminal, or
+        // job control and Ctrl-C never reach it. std dup2's the stdio fds before `pre_exec`
+        // runs, so fd 0 is already the slave here.
+        // SAFETY: a fresh forked child: setsid and an ioctl on our own fd 0, both
+        // async-signal-safe.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0
+                    || libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY as _, 0) < 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            })
+        };
+        let mut child = cmd.spawn()?;
+        // Dropping the parent's slave (and `cmd`'s clones) is what makes the reader see EOF
+        // once the shell exits.
+        drop(cmd);
+        drop(slave);
+
+        let mut reader = std::fs::File::from(master.try_clone()?);
+        let mut writer = std::fs::File::from(master);
+        let (tx, rx) = mpsc::channel::<Vec<u8>>();
+        // Writes go through their own thread: a shell that is not reading (busy, or a big
+        // paste filling the tty buffer) blocks the write, which must not block the UI.
+        std::thread::spawn(move || {
+            for bytes in rx {
+                if writer.write_all(&bytes).is_err() {
+                    break;
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            // Output can split a UTF-8 character across reads; carry the tail until it is whole.
+            let mut carry: Vec<u8> = Vec::new();
+            loop {
+                let n = match reader.read(&mut buf) {
+                    Ok(0) => break, // EOF: every holder of the slave is gone (macOS)
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break, // EIO: the same, as Linux reports it
+                };
+                carry.extend_from_slice(&buf[..n]);
+                loop {
+                    match std::str::from_utf8(&carry) {
+                        Ok(s) => {
+                            on_out(s.to_string());
+                            carry.clear();
+                            break;
+                        }
+                        Err(e) => {
+                            let ok = e.valid_up_to();
+                            if ok > 0 {
+                                on_out(String::from_utf8_lossy(&carry[..ok]).into_owned());
+                                carry.drain(..ok);
+                            } else if e.error_len().is_some() {
+                                carry.remove(0); // a stray byte the shell's tty mangled: skip it
+                            } else {
+                                break; // an incomplete character: wait for the next read
+                            }
+                        }
+                    }
+                }
+            }
+            // Reap the shell so each restart does not leave a zombie behind.
+            let _ = child.wait();
+            on_exit();
+        });
+        Ok(Arc::new(Pty { tx }))
+    }
+
+    /// Send bytes to the shell: a keypress or a paste, as [`key_bytes`] spelled it. Queued
+    /// for the writer thread, which writes all of it in order.
+    pub fn write(&self, bytes: &[u8]) {
+        let _ = self.tx.send(bytes.to_vec());
+    }
+}
+
+/// The bytes a terminal sends for `e`, or `None` when the key belongs to the app (a shortcut,
+/// a scroll key).
+pub fn key_bytes(e: &KeyEvent) -> Option<Vec<u8>> {
+    let m = &e.mods;
+    // Ctrl plus a letter is how a terminal speaks: Ctrl-C (\x03), Ctrl-D (\x04), Ctrl-L…
+    // Rune delivers it as `Command(c)` off macOS (where ⌘C stays a copy: `ctrl` is unset).
+    if m.ctrl && !m.alt {
+        let c = match &e.key {
+            Key::Command(c) => Some(*c),
+            Key::Text(t) => t.chars().next(),
+            _ => None,
+        };
+        if let Some(c) = c {
+            return ctrl_byte(c).map(|b| vec![b]);
+        }
+    }
+    let esc = |b: &[u8]| {
+        let mut out = vec![0x1b];
+        out.extend_from_slice(b);
+        out
+    };
+    let arrow = |csi: &str| -> Option<Vec<u8>> {
+        // Ctrl+arrow is the word-jump chord readline expects.
+        if m.ctrl {
+            Some(format!("\x1b[1;5{csi}").into_bytes())
+        } else if m.alt {
+            Some(esc(&format!("[{csi}").into_bytes()))
+        } else {
+            Some(format!("\x1b[{csi}").into_bytes())
+        }
+    };
+    match &e.key {
+        Key::Text(t) => {
+            if t == "\r" || t == "\n" {
+                return Some(b"\r".to_vec());
+            }
+            // Option/Alt prefixes a byte with ESC, the terminal's meta key.
+            (!m.cmd && !m.ctrl && !m.alt)
+                .then(|| t.as_bytes().to_vec())
+                .or_else(|| m.alt.then(|| esc(t.as_bytes())))
+        }
+        Key::Enter => Some(b"\r".to_vec()),
+        Key::Backspace => Some(if m.alt {
+            esc(b"\x7f")
+        } else {
+            b"\x7f".to_vec()
+        }),
+        Key::Delete => Some(b"\x1b[3~".to_vec()),
+        Key::Tab => Some(if m.shift {
+            b"\x1b[Z".to_vec()
+        } else {
+            b"\t".to_vec()
+        }),
+        Key::Escape => Some(b"\x1b".to_vec()),
+        Key::Left => arrow("D"),
+        Key::Right => arrow("C"),
+        Key::Up => arrow("A"),
+        Key::Down => arrow("B"),
+        Key::Home => Some(b"\x1b[H".to_vec()),
+        Key::End => Some(b"\x1b[F".to_vec()),
+        // Page keys scroll the pane's scrollback instead, and everything else (function
+        // keys, ⌘-chords the app may own) is not the shell's.
+        _ => None,
+    }
+}
+
+/// The control code a terminal sends for Ctrl plus `c`, or `None` for keys it does not have.
+fn ctrl_byte(c: char) -> Option<u8> {
+    let c = c.to_ascii_lowercase();
+    Some(match c {
+        '@' | ' ' => 0,
+        'a'..='z' => c as u8 - b'a' + 1,
+        '[' => 0x1b,
+        '\\' => 0x1c,
+        ']' => 0x1d,
+        '^' => 0x1e,
+        '_' => 0x1f,
+        _ => return None,
+    })
+}
+
+/// What the escape parser is mid-way through.
+#[derive(Default)]
+enum St {
+    #[default]
+    Ground,
+    /// After ESC.
+    Esc,
+    /// Inside a CSI sequence: its parameters, until the final byte.
+    Csi(String),
+    /// Inside an OSC (window title) string, which ends at BEL.
+    Osc,
+    /// An ESC inside an OSC: `ESC \` ends it.
+    OscEsc,
+    /// A charset selection (`ESC ( B`): the next char is discarded.
+    Charset,
+}
+
+/// A minimal terminal line renderer: a scroll of lines plus the line being written at
+/// `col`, which is all a shell prompt and command output need. Colours, cursor addressing
+/// and other full-screen sequences are consumed silently; `\r`, backspace, tab,
+/// erase-in-line (`ESC [ K`) and clear-screen (`ESC [ 2 J`) are honoured, which is what
+/// readline redraws and the `clear` command use.
+#[derive(Default)]
+pub struct TermScreen {
+    lines: Vec<String>,
+    /// The line under the cursor (never committed to `lines`).
+    cur: Vec<char>,
+    col: usize,
+    st: St,
+}
+
+impl TermScreen {
+    /// Render `chunk` (already whole UTF-8) into the screen.
+    pub fn feed(&mut self, chunk: &str) {
+        for c in chunk.chars() {
+            match std::mem::replace(&mut self.st, St::Ground) {
+                St::Ground => self.ground(c),
+                St::Esc => self.esc(c),
+                St::Csi(mut params) => {
+                    match c {
+                        // Parameter (0-9 ; : < = > ?) and intermediate (space ! " # … /)
+                        // bytes, e.g. the space in DECSCUSR's `ESC [ 2 SP q`.
+                        '\x20'..='\x3f' => {
+                            params.push(c);
+                            self.st = St::Csi(params);
+                        }
+                        '\x40'..='\x7e' => self.csi(&params, c),
+                        // Not a CSI byte: the sequence is malformed, draw `c` as plain output.
+                        _ => self.ground(c),
+                    }
+                }
+                St::Osc => {
+                    if c == '\x07' {
+                        // ends the title string
+                    } else if c == '\x1b' {
+                        self.st = St::OscEsc;
+                    } else {
+                        self.st = St::Osc;
+                    }
+                }
+                St::OscEsc => {
+                    if c != '\\' {
+                        self.st = St::Osc;
+                    }
+                }
+                St::Charset => {} // the charset designator itself: discarded
+            }
+        }
+    }
+
+    fn ground(&mut self, c: char) {
+        match c {
+            '\n' => {
+                let line: String = self.cur.drain(..).collect();
+                self.lines.push(line);
+                if self.lines.len() > super::state::TERM_LINES {
+                    let cut = self.lines.len() - super::state::TERM_LINES;
+                    self.lines.drain(..cut);
+                }
+                self.col = 0;
+            }
+            '\r' => self.col = 0,
+            '\x08' => self.col = self.col.saturating_sub(1),
+            '\t' => {
+                let stop = (self.col / 8 + 1) * 8;
+                while self.cur.len() < stop {
+                    self.cur.push(' ');
+                }
+                self.col = stop;
+            }
+            '\x07' => {} // a bell: nothing to draw
+            '\x1b' => self.st = St::Esc,
+            c if (c as u32) < 0x20 => {} // other control codes: nothing to draw
+            c => {
+                while self.cur.len() < self.col {
+                    self.cur.push(' ');
+                }
+                if self.col < self.cur.len() {
+                    self.cur[self.col] = c;
+                } else {
+                    self.cur.push(c);
+                }
+                self.col += 1;
+            }
+        }
+    }
+
+    fn esc(&mut self, c: char) {
+        self.st = match c {
+            '[' => St::Csi(String::new()),
+            ']' => St::Osc,
+            // Charset selection and other two-byte escapes (`ESC # 8`, `ESC % G`, …).
+            '(' | ')' | '*' | '+' | '#' | '%' | ' ' => St::Charset,
+            _ => St::Ground, // a single-char escape (ESC 7, ESC M, …): nothing to draw
+        };
+    }
+
+    /// A CSI sequence's final byte: only the erase/clear and in-line cursor moves touch the
+    /// screen.
+    fn csi(&mut self, params: &str, end: char) {
+        if params.bytes().any(|b| (0x20..=0x2f).contains(&b)) {
+            return; // an intermediate byte: cursor shape and the like, nothing to draw
+        }
+        let private = params.starts_with('?');
+        let n = params
+            .trim_start_matches('?')
+            .split(';')
+            .next()
+            .unwrap_or("");
+        let n = n.parse::<usize>().unwrap_or(0);
+        match end {
+            'K' => match n {
+                0 => self.cur.truncate(self.col), // erase to the end of the line
+                1 => {
+                    // erase back to the column: blanks, then the cursor sits at the start
+                    for c in self.cur.iter_mut().take(self.col + 1) {
+                        *c = ' ';
+                    }
+                }
+                _ => {
+                    self.cur.clear();
+                    self.col = 0;
+                }
+            },
+            // In-line cursor moves (readline and zsh redraws, right-aligned prompts): back,
+            // forward, and to an absolute (1-based) column.
+            'D' if !private => self.col = self.col.saturating_sub(n.max(1)),
+            'C' if !private => self.col += n.max(1),
+            'G' if !private => self.col = n.max(1) - 1,
+            'J' if n >= 2 => {
+                // `clear`: the whole screen
+                self.lines.clear();
+                self.cur.clear();
+                self.col = 0;
+            }
+            _ => {} // cursor moves, colours, modes: nothing a line renderer can draw
+        }
+    }
+
+    /// The committed scrollback (the render adds the line under the cursor).
+    #[cfg(test)]
+    fn lines(&self) -> &Vec<String> {
+        &self.lines
+    }
+
+    /// The screen as lines: the committed scrollback plus the line under the cursor.
+    #[cfg(test)]
+    fn rows(&self) -> Vec<String> {
+        let mut out = self.lines.clone();
+        out.push(self.cur.iter().collect());
+        out
+    }
+
+    /// The last `n` rows (the line under the cursor included), joined with newlines; empty
+    /// when nothing has been written.
+    pub fn tail(&self, n: usize) -> String {
+        let skip = (self.lines.len() + 1).saturating_sub(n);
+        let mut out = String::new();
+        for line in self.lines.iter().skip(skip) {
+            out.push_str(line);
+            out.push('\n');
+        }
+        out.extend(self.cur.iter());
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn screen(s: &str) -> Vec<String> {
+        let mut t = TermScreen::default();
+        t.feed(s);
+        t.rows()
+    }
+
+    #[test]
+    fn plain_output_is_lines() {
+        assert_eq!(screen("a\nb\r\n"), ["a", "b", ""]);
+    }
+
+    #[test]
+    fn carriage_return_overwrites_the_line() {
+        // A progress counter: `1` is replaced by `2` on the same line.
+        assert_eq!(screen("1%\r2%"), ["2%"]);
+    }
+
+    #[test]
+    fn backspace_and_tab_edit_the_line() {
+        assert_eq!(screen("ab\x08c"), ["ac"]);
+        assert_eq!(screen("a\tb"), ["a       b"]);
+    }
+
+    #[test]
+    fn colours_and_titles_are_stripped() {
+        assert_eq!(screen("\x1b[1;32mok\x1b[0m\n"), ["ok", ""]);
+        assert_eq!(screen("\x1b]0;title\x07ls\r\n"), ["ls", ""]);
+        assert_eq!(screen("\x1b]0;title\x1b\\ls\r\n"), ["ls", ""]);
+    }
+
+    #[test]
+    fn erase_in_line_truncates_and_clear_clears() {
+        // readline redraws a shorter line with ESC [ K; `clear` empties the screen.
+        assert_eq!(screen("abc\x1b[K"), ["abc"]);
+        assert_eq!(screen("old\r\x1b[2Knew"), ["new"]);
+        assert_eq!(screen("x\n\x1b[2Jy"), ["y"]);
+    }
+
+    #[test]
+    fn intermediate_bytes_and_cursor_moves() {
+        // DECSCUSR (cursor shape) draws nothing — no stray `q`.
+        assert_eq!(screen("a\x1b[2 qb"), ["ab"]);
+        assert_eq!(screen("\x1b#8ok"), ["ok"]);
+        // Back two, overwrite; forward pads; absolute column.
+        assert_eq!(screen("abcd\x1b[2DX"), ["abXd"]);
+        assert_eq!(screen("a\x1b[3Cb"), ["a   b"]);
+        assert_eq!(screen("abcd\x1b[2GX"), ["aXcd"]);
+        assert_eq!(screen("abcd\x1b[GX"), ["Xbcd"]);
+    }
+
+    #[test]
+    fn tail_matches_the_last_rows() {
+        let mut t = TermScreen::default();
+        assert_eq!(t.tail(3), "");
+        t.feed("a\nb\nc\nd");
+        assert_eq!(t.tail(3), "b\nc\nd");
+        assert_eq!(t.tail(10), t.rows().join("\n"));
+    }
+
+    #[test]
+    fn line_cap_keeps_the_tail() {
+        let mut t = TermScreen::default();
+        for i in 0..super::super::state::TERM_LINES + 10 {
+            t.feed(&format!("{i}\n"));
+        }
+        assert_eq!(t.lines().len(), super::super::state::TERM_LINES);
+        assert_eq!(t.lines().first().map(String::as_str), Some("10"));
+    }
+
+    #[test]
+    fn keys_spell_terminal_bytes() {
+        let k = |key: Key, ctrl: bool| KeyEvent {
+            key,
+            mods: rune::Mods {
+                ctrl,
+                ..rune::Mods::default()
+            },
+        };
+        assert_eq!(
+            key_bytes(&k(Key::Text("ls".into()), false)),
+            Some(b"ls".to_vec())
+        );
+        assert_eq!(key_bytes(&k(Key::Enter, false)), Some(b"\r".to_vec()));
+        assert_eq!(key_bytes(&k(Key::Backspace, false)), Some(b"\x7f".to_vec()));
+        assert_eq!(key_bytes(&k(Key::Up, false)), Some(b"\x1b[A".to_vec()));
+        assert_eq!(key_bytes(&k(Key::Up, true)), Some(b"\x1b[1;5A".to_vec()));
+        assert_eq!(
+            key_bytes(&k(Key::Command('c'), true)),
+            Some(b"\x03".to_vec())
+        );
+        assert_eq!(
+            key_bytes(&k(Key::Command('d'), true)),
+            Some(b"\x04".to_vec())
+        );
+        assert_eq!(
+            key_bytes(&k(Key::Text("C".into()), true)),
+            Some(b"\x03".to_vec()),
+            "Ctrl+Shift+C is still Ctrl-C, not an underflow"
+        );
+        assert_eq!(
+            key_bytes(&k(Key::Command('c'), false)),
+            None,
+            "a bare ⌘C copies"
+        );
+        assert_eq!(
+            key_bytes(&k(Key::PageUp, false)),
+            None,
+            "the pane scrolls instead"
+        );
+    }
+
+    /// A real shell in a real PTY: `echo` writes back through the tty, and the exit closes it.
+    #[test]
+    fn a_shell_round_trips_through_the_pty() {
+        let dir = std::env::temp_dir().join(format!("dex-gui-pty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let ex = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let (o, e2) = (out.clone(), ex.clone());
+        let pty = Pty::spawn(
+            dir.to_str().unwrap(),
+            move |s| o.lock().unwrap().push_str(&s),
+            move || *e2.lock().unwrap() = true,
+        )
+        .expect("openpty");
+        // Keep every keystroke a plain byte so no readline of the host's $SHELL can swallow it.
+        for b in b"printf dex-term-probe; exit\n" {
+            pty.write(&[*b]);
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !*ex.lock().unwrap() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(*ex.lock().unwrap(), "the shell exited");
+        assert!(
+            out.lock().unwrap().contains("dex-term-probe"),
+            "the tty echoed the command"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
