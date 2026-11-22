@@ -605,10 +605,12 @@ pub fn sidebar(s: &State, k: &Kit, inset: f32) -> El {
     } else {
         projects.len().min(tok::PROJECTS)
     };
+    // A project group is set off from the one above it: a gap over every header but the
+    // first, so a project's last thread doesn't read as the next project's first.
     for (pi, (cwd, threads)) in projects.iter().take(take).enumerate() {
         let collapsed = s.collapsed.contains(cwd);
         let name = project_name(cwd);
-        sb = sb.child(project_header(
+        let mut header = project_header(
             k,
             ProjectHeader {
                 key: format!("proj{pi}"),
@@ -616,7 +618,11 @@ pub fn sidebar(s: &State, k: &Kit, inset: f32) -> El {
                 name,
                 cwd: cwd.clone(),
             },
-        ));
+        );
+        if pi > 0 {
+            header = header.mt(space::LG);
+        }
+        sb = sb.child(header);
         if collapsed {
             continue;
         }
