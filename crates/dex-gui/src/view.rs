@@ -777,26 +777,6 @@ fn item(i: usize, it: &Item, k: &Kit) -> El {
     }
 }
 
-/// The turn's live status, pinned above the composer's card while it runs: a thin quiet line in
-/// the footer's meta style, not a heavy card — the send slot already morphs into Stop, so no
-/// stop control rides here. The tail item names the phase: a streaming reply vs. the turn still
-/// chewing on the user's ask.
-fn live_row(s: &State, k: &Kit) -> El {
-    let label = match s.items.last() {
-        Some(Item::Assistant { .. }) => "Replying",
-        _ => "Working",
-    };
-    row()
-        .key("live")
-        .w_full()
-        .h(18.0)
-        .px(CONTENT)
-        .gap(space::SM)
-        .items_center()
-        .child(Spinner::new().size(12.0).build(k))
-        .child(text(label).font(typo::meta(k)).color(k.c.text_faint))
-}
-
 fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
     // The field's height follows its wrapped lines in the same frame. Springing it (rune's
     // `auto_grow`) leaves the new line flush against the bottom edge until the spring catches up.
@@ -861,11 +841,6 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
                 .child(action),
         );
     let mut stack = col().w_full().max_w(COLUMN).gap(space::SM);
-    // The live row pins above everything queued (and the card), the turn's pulse at the
-    // composer's edge instead of the transcript's.
-    if s.busy() {
-        stack = stack.child(live_row(s, k));
-    }
     for (i, q) in s.queue.iter().enumerate() {
         let label = if q.followup { "Queued" } else { "Steering" };
         stack = stack.child(
