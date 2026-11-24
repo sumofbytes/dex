@@ -280,15 +280,6 @@ fn transcript(s: &State, k: &Kit) -> El {
         list = list.child(el);
         i += 1;
     }
-    // A reply streaming (or a turn that has not produced anything yet) has no work block to
-    // carry the live row.
-    if s.busy() {
-        match s.items.last() {
-            Some(Item::Assistant { .. }) => list = list.child(live_row(k, "Replying")),
-            Some(Item::User(_)) => list = list.child(live_row(k, "Working")),
-            _ => {}
-        }
-    }
     // The viewport must be a column: a row would stretch its child to the viewport's height,
     // so the content would never overflow and nothing could scroll.
     col()
@@ -306,7 +297,7 @@ fn transcript(s: &State, k: &Kit) -> El {
         )
 }
 
-/// The ghost Stop button a live row carries, with its Esc hint.
+/// The ghost Stop button a live work head carries, with its Esc hint.
 fn stop_button(k: &Kit) -> El {
     k.interactive(
         row()
@@ -320,26 +311,6 @@ fn stop_button(k: &Kit) -> El {
     )
     .on_press(|s: &mut State| s.send_cmd(Cmd::Cancel))
     .key("stop")
-}
-
-/// The live row while a turn runs: spinner on the block head's mark column (flush with the
-/// text edge), label on its text column, and the ghost Stop button at the right end. Gone once
-/// the turn ends.
-fn live_row(k: &Kit, label: &str) -> El {
-    row()
-        .w_full()
-        .h(24.0)
-        .pr(space::MD)
-        .gap(space::SM)
-        .items_center()
-        .child(Spinner::new().size(12.0).build(k))
-        .child(
-            text(label.to_string())
-                .font(k.ty.ui_medium)
-                .color(k.c.text_muted),
-        )
-        .child(spacer().grow(1.0))
-        .child(stop_button(k))
 }
 
 /// A run of tool calls (`start..end`): a quiet summary line that opens to the rows.
@@ -827,8 +798,7 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .w_full()
         .px(space::MD)
         .py(space::MD)
-        .min_h(44.0)
-        .max_h(220.0);
+        .min_h(44.0);
 
     let mode = crate::composer_menu::mode(s, k, layer);
     let model = crate::composer_menu::model(s, k, layer);
@@ -853,7 +823,7 @@ fn composer(s: &State, k: &Kit, layer: &mut Vec<El>) -> El {
         .max_w(COLUMN)
         .padding(space::XS)
         .gap(space::XXS)
-        .radius(k.radius.xl)
+        .radius(k.radius.lg)
         .fill(k.c.layer_02)
         .border(1.0, k.c.border_base)
         .child(input)

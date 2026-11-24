@@ -88,6 +88,22 @@ uuid = { version = "1", features = ["v4"] }
 [dev-dependencies]
 axum = "0.8"
 
+# Rune's upstream tree at the pinned rev vendors a few crates as published plus a patch, and
+# documents that an app building Rune must mirror its `[patch.crates-io]` (a dependency's `[patch]`
+# doesn't apply to the workspace that depends on it): `parley_engine` without it lacks the
+# `line-dictionaries` feature `rune-text` requires, and `winit`/`sctk-adwaita` without it lack the
+# Wayland client-side-frame corner APIs `rune` calls under `cfg(unix)`. Windows/macOS-only
+# (`wgpu-hal`, `accesskit_*`) are patched the same way for parity; on Linux the vendored
+# `wgpu-hal`'s `expose_adapter` is behind a fallback trait, so an unpatched build still works.
+# Re-pin these to the same rev whenever the rune git pins above move.
+[patch.crates-io]
+wgpu-hal = { git = "https://github.com/anomalyco/rune", rev = "f05046ac10fc124f9314c3ee6dc2434e2e6e2752" }
+winit = { git = "https://github.com/anomalyco/rune", rev = "f05046ac10fc124f9314c3ee6dc2434e2e6e2752" }
+sctk-adwaita = { git = "https://github.com/anomalyco/rune", rev = "f05046ac10fc124f9314c3ee6dc2434e2e6e2752" }
+parley_engine = { git = "https://github.com/anomalyco/rune", rev = "f05046ac10fc124f9314c3ee6dc2434e2e6e2752" }
+accesskit_windows = { git = "https://github.com/anomalyco/rune", rev = "f05046ac10fc124f9314c3ee6dc2434e2e6e2752" }
+accesskit_macos = { git = "https://github.com/anomalyco/rune", rev = "f05046ac10fc124f9314c3ee6dc2434e2e6e2752" }
+
 # Symbols for profilers (parca-agent / perf / heaptrack) without touching
 # release output: RUSTFLAGS="-C force-frame-pointers=yes" cargo build --profile profiling
 [profile.profiling]

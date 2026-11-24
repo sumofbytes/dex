@@ -11,6 +11,13 @@
 //! *behavior* — like `net_client` (redirect `none`: confinement is checked
 //! pre-redirect) or `LlmConfig::http_client` (explicit
 //! `DEX_HTTP_*_TIMEOUT_SECS` overrides).
+//!
+//! tokio is held at 1.53.x in `Cargo.lock`: on 1.54 (through hyper/reqwest)
+//! `send()` to a server that answers headers and then stalls is canceled
+//! instantly with `hyper::Error(Canceled, UnexpectedMessage)` instead of
+//! handing the response to the idle watchdog — see
+//! `llm::transport::sse::tests::stalled_stream_fails_after_idle_deadline`.
+//! Re-check before lifting the pin.
 
 use std::sync::OnceLock;
 use std::time::Duration;

@@ -83,6 +83,7 @@ One grid (`src/sidebar.rs::tok`, board "dex / Sidebar v3 · grid"). Width 280, m
 - The whole project header toggles collapse (no chevron); × (hide) shows on hover only. The 16px lead holds a static folder icon in the project colour — it never shows a spinner; a running thread's spinner lives on its own row. Titles truncate with an ellipsis.
 - A double-click on a thread row edits its title in place: the title becomes a single-line field with the text selected, Return sends the rename to the daemon (`POST /api/sessions/{id}/name`), Escape or a press elsewhere keeps the old title.
 - The PROJECTS label row ends with a `+` (same slot grid as the project headers' `+`) that opens the platform's folder picker; the picked folder becomes the next thread's project and lists in the sidebar right away (not in Paper yet).
+- Project groups are separated by a 10pt gap over every project header after the first (`space::LG`), so a project's last thread can't read as the next project's first; the gap also sits between two collapsed project headers.
 
 ## Composer options
 
